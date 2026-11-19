@@ -14,8 +14,8 @@ from pathlib import Path
 
 import anthropic
 
-from . import github, mcp_bridge, pricing, voice, wake, watch, web
-from .agent import AUTO_MAX_STEPS, DEFAULT_MAX_STEPS, DEFAULT_MODEL, Jarvis
+from . import autopilot, github, mcp_bridge, notify, pricing, sandbox, selftest, team, voice, wake, watch, web
+from .agent import AUTO_MAX_STEPS, DEFAULT_MAX_STEPS, DEFAULT_MODEL, Jarvis, TokenBudget, parse_tokens
 from .dashboard import Dashboard
 from .memory import Memory
 from .tools import ToolContext
@@ -120,6 +120,12 @@ class RunLog:
             self.summary["cost_usd"] = pricing.estimate_cost(self.jarvis.model, usage)
         self._write(f"\n## Outcome\n\n{'Finished' if ok else 'Stopped with an error'}.\n")
         self._save()
+
+    def crew(self, status: str) -> None:
+        self.section("Crew", status)
+
+    def section(self, title: str, body: str) -> None:
+        self._write(f"\n## {title}\n\n```\n{body}\n```")
 
     def result(self, name: str, content: object, is_error: bool) -> None:
         if is_error:
@@ -244,7 +250,7 @@ def listen(io: VoiceIO) -> str:
 
 
 def chat_loop(jarvis: Jarvis, io: VoiceIO | None, workspace: Path, read: Callable[[str], str] = input) -> int:
-    commands = "/reset, /memory, /tools, /exit" + (", /mute, /unmute" if io else "")
+    commands = "/reset, /memory, /tools, " + ("/team, " if jarvis.team else "") + "/exit" + (", /mute, /unmute" if io else "")
     print(f"{CYAN}Jarvis online.{RESET} Workspace: {workspace}. Commands: {commands}")
     if io:
         print("Voice mode: press Enter to talk, press Enter again to stop. You can still type messages.")
@@ -278,6 +284,9 @@ def chat_loop(jarvis: Jarvis, io: VoiceIO | None, workspace: Path, read: Callabl
             continue
         if prompt == "/tools":
             print(f"{len(jarvis._tools)} tools. MCP servers: {jarvis.mcp.summary() if jarvis.mcp else 'none'}")
+            continue
+        if prompt == "/team":
+            print(jarvis.team.status() if jarvis.team else "Team mode is off. Start Jarvis with --team.")
             continue
         if prompt == "/reset":
             jarvis.reset()
@@ -359,10 +368,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=os.environ.get("JARVIS_MODEL", DEFAULT_MODEL))
     parser.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
     parser.add_argument("-y", "--yes", action="store_true", help="Auto-approve file writes and shell commands.")
+    parser.add_argument("--team", action="store_true", default=os.environ.get("JARVIS_TEAM") == "1", help="Team mode: Jarvis becomes the chief of a seven-agent crew and delegates to six specialists (Scout, Architect, Medic, Forge, Sentinel, Herald). Also JARVIS_TEAM=1.")
+    parser.add_argument("--sentinel-mcp", default=os.environ.get("JARVIS_SENTINEL_MCP", ""), metavar="SERVERS", help="Team mode: MCP servers (comma-separated names from your MCP config) whose write tools Sentinel may use, e.g. 'playwright' for a browser. Other MCP tools are read-only for the crew. Also JARVIS_SENTINEL_MCP.")
+    parser.add_argument("--team-models", default=os.environ.get("JARVIS_TEAM_MODELS", ""), metavar="SPEC", help="Team mode: models per specialist, e.g. 'scout=claude-sonnet-5-5,herald=claude-haiku-5-5'. 'economy' runs Scout, Medic and Herald on claude-sonnet-5-5 and can be combined: 'economy,forge=...'. Others use --model. Implies --team. Also JARVIS_TEAM_MODELS.")
+    parser.add_argument("--token-budget", default=os.environ.get("JARVIS_TOKEN_BUDGET", ""), metavar="TOKENS", help="Stop when Jarvis and its specialists together have used this many tokens (input, cache and output), e.g. 500k or 2M. Also JARVIS_TOKEN_BUDGET. Default: no cap. For a dollar limit use --budget.")
+    parser.add_argument("--selftest", action="store_true", help=f"Live end-to-end check of team mode: the crew fixes a planted bug in a local repository, then Jarvis verifies the result itself. Uses your API key; capped at {selftest.DEFAULT_BUDGET:,} tokens unless --token-budget is set. Needs no GitHub token.")
     parser.add_argument("--auto", action="store_true", help="Autonomous agent: works through the goal end to end (research, build, test, commit, open a draft PR) without asking. Implies --yes. Logs to ~/.jarvis/runs/.")
     parser.add_argument("--brief", nargs="?", const="", metavar="OWNER", help="Morning briefing: what needs your attention across your GitHub repositories (open PRs, new issues, failing CI). Optionally name a user or organisation; defaults to the token's account. Combine with --voice to hear it.")
     parser.add_argument("--watch", nargs="*", metavar="TARGET", help="Watch mode: announce when a default-branch build breaks or recovers. Targets are owner/name repositories or owners (their repositories active in the last 30 days); none means the token's account. With --web, shows them on the web dashboard instead.")
     parser.add_argument("--interval", type=float, default=5, help="Watch mode: minutes between checks (default 5).")
+    group_box = parser.add_argument_group("sandbox")
+    group_box.add_argument("--sandbox", action="store_true", default=os.environ.get("JARVIS_SANDBOX") == "1", help="Run every run_command in a throwaway Docker container that sees only the repository: no home directory, keys or environment variables, all capabilities dropped, resource limits. Also JARVIS_SANDBOX=1.")
+    group_box.add_argument("--sandbox-image", default=os.environ.get("JARVIS_SANDBOX_IMAGE", sandbox.DEFAULT_IMAGE), help=f"Image for sandboxed commands (default {sandbox.DEFAULT_IMAGE}: Node, Python 3, git, build tools).")
+    group_box.add_argument("--sandbox-network", default="bridge", choices=sandbox.NETWORKS, help="Sandbox networking: bridge (default, so installs work) or none.")
+    group_auto = parser.add_argument_group("automation")
+    group_auto.add_argument("--issues", nargs="+", metavar="REPO", help="Issue autopilot: the crew works open issues labelled --label in these repositories (owner/name) and opens a draft PR for each. Implies --team --auto. Uses --interval.")
+    group_auto.add_argument("--label", default=autopilot.DEFAULT_LABEL, help=f"Issue autopilot: the label that hands an issue to Jarvis (default '{autopilot.DEFAULT_LABEL}').")
+    group_auto.add_argument("--any-author", action="store_true", help="Issue autopilot: also work labelled issues opened by people outside the repository (by default only owners, members and collaborators, because authors can edit an issue after it is labelled).")
+    group_auto.add_argument("--per-poll", type=int, default=1, help="Issue autopilot: issues to work per round (default 1).")
+    group_auto.add_argument("--notify", default=os.environ.get("JARVIS_NOTIFY", ""), metavar="URL", help="Send a summary when an autonomous run, self-test, watch fix or autopilot issue finishes: an ntfy topic URL, a Slack or a Discord webhook. Also JARVIS_NOTIFY.")
     parser.add_argument("--fix", action="store_true", help="Watch mode: when a build breaks, run an autonomous fix that opens a draft PR. Implies --auto.")
     group_web = parser.add_argument_group("web and phone")
     group_web.add_argument("--web", action="store_true", help="Serve a chat page with streaming replies, approvals and browser voice. Opens on this computer only unless --web-host is set.")
@@ -370,7 +394,7 @@ def main(argv: list[str] | None = None) -> int:
     group_web.add_argument("--web-port", type=int, default=8765)
     group_web.add_argument("--web-cert", type=Path, help="TLS certificate (PEM) to serve HTTPS. Phones only allow the microphone over HTTPS.")
     group_web.add_argument("--web-key", type=Path, help="TLS private key (PEM) for --web-cert.")
-    parser.add_argument("--budget", type=float, default=None, metavar="USD", help="Spending limit for this session in US dollars, from the estimated cost of its tokens at list price. Jarvis warns at 80%% and stops before going over. Works with models that have a known price.")
+    parser.add_argument("--budget", type=float, default=None, metavar="USD", help="Spending limit for this session in US dollars, from the estimated cost of its tokens at list price. In team mode it covers Jarvis and every specialist together. Jarvis warns at 80%% and stops before going over. Works with models that have a known price.")
     parser.add_argument("--max-steps", type=int, default=None, help=f"Max agent steps per request (default {DEFAULT_MAX_STEPS}, or {AUTO_MAX_STEPS} with --auto).")
     group = parser.add_argument_group("voice")
     group.add_argument("--voice", action="store_true", help="Talk to Jarvis: push-to-talk input and spoken replies.")
@@ -383,6 +407,47 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.budget is not None and args.budget <= 0:
         parser.error("--budget must be more than 0")
+    try:
+        args.team_models = team.parse_models(args.team_models)
+    except ValueError as err:
+        parser.error(f"--team-models: {err}")
+    if args.team_models:
+        args.team = True
+    try:
+        args.token_budget = parse_tokens(args.token_budget) if args.token_budget else None
+    except ValueError as err:
+        parser.error(f"--token-budget: {err}")
+    args.selftest_repo = None
+    if args.selftest:
+        if args.prompt or args.watch is not None or args.web or args.brief is not None:
+            parser.error("--selftest runs on its own; drop the prompt, --watch, --web and --brief")
+        run_dir = home / "selftest" / time.strftime("%Y%m%d-%H%M%S")
+        args.workspace = run_dir / "repos"
+        args.selftest_repo = selftest.build_fixture(args.workspace)
+        args.auto = args.team = True
+        args.token_budget = args.token_budget or selftest.DEFAULT_BUDGET
+        args.prompt = [selftest.GOAL]
+    if args.notify:
+        try:
+            notify.validate_url(args.notify)
+        except ValueError as err:
+            parser.error(f"--notify: {err}")
+    if args.issues:
+        if args.prompt or args.watch is not None or args.web or args.brief is not None or args.selftest:
+            parser.error("--issues runs on its own; drop the prompt, --watch, --web, --brief and --selftest")
+        if args.per_poll < 1:
+            parser.error("--per-poll must be at least 1")
+        try:
+            args.issues = [github.validate_repo(r) for r in args.issues]
+        except github.GitHubError as err:
+            parser.error(f"--issues: {err}")
+        args.auto = args.team = True
+    if args.budget is not None and args.team:
+        # A dollar limit is only enforceable when every agent's model has a known price.
+        unpriced = sorted({m for m in [args.model, *args.team_models.values()]
+                           if pricing.PRICES.get(m) is None})
+        if unpriced:
+            parser.error(f"--budget: no price is known for {', '.join(unpriced)}, so a spending limit can't be enforced")
     if args.fix:
         if args.watch is None:
             parser.error("--fix works with --watch")
@@ -404,6 +469,16 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     args.workspace.mkdir(parents=True, exist_ok=True)
+    args.sandbox_box = None
+    if args.sandbox:
+        try:
+            args.sandbox_box = sandbox.Sandbox(home_root=args.workspace.parent / "sandbox-home",
+                                               image=args.sandbox_image, network=args.sandbox_network)
+            print(f"{DIM}Preparing the sandbox (the first run may pull {args.sandbox_image})...{RESET}")
+            print(f"{DIM}{args.sandbox_box.check()}{RESET}")
+        except sandbox.SandboxError as err:
+            print(f"Sandbox unavailable: {err}", file=sys.stderr)
+            return 2
     mcp = None if args.no_mcp else start_mcp(args.mcp_config, args.workspace.parent / "logs")
     try:
         return run(args, io, listener, mcp)
@@ -518,7 +593,8 @@ def run_web(args: argparse.Namespace, jarvis: Jarvis) -> int:
     return 0
 
 
-def run_watch(args: argparse.Namespace, jarvis: Jarvis, io: VoiceIO | None, log: RunLog | None = None) -> int:
+def run_watch(args: argparse.Namespace, jarvis: Jarvis, io: VoiceIO | None, log: RunLog | None = None,
+              notifier: notify.Notifier | None = None) -> int:
     try:
         watcher = make_watcher(args.watch)
     except github.GitHubError as err:
@@ -534,6 +610,8 @@ def run_watch(args: argparse.Namespace, jarvis: Jarvis, io: VoiceIO | None, log:
     def fix(alert: watch.Alert) -> None:
         print(f"{DIM}Starting an autonomous fix for {alert.repo} ({alert.workflow})...{RESET}")
         jarvis.reset()
+        if jarvis.token_budget is not None:
+            jarvis.token_budget.reset()  # each fix gets the full --token-budget; --budget stays session-wide
         prompt = watch.fix_prompt(alert)
         if log:
             log.goal(prompt)
@@ -542,11 +620,66 @@ def run_watch(args: argparse.Namespace, jarvis: Jarvis, io: VoiceIO | None, log:
             log.finish(reply is not None, reply)
         if reply is None:
             print(f"{DIM}The fix attempt stopped with an error; watching continues.{RESET}")
+        if notifier:
+            notifier.send(f"Jarvis fix {'finished' if reply is not None else 'failed'}: {alert.repo} {alert.workflow}",
+                          reply or "The fix attempt stopped with an error; see the run log.")
 
     print(f"{CYAN}Jarvis is watching{RESET} {', '.join(watcher.repos + watcher.owners)} every {args.interval:g} min. Ctrl+C stops.")
     try:
         watch.watch_loop(watcher, announce, report=lambda m: print(f"{DIM}{m}{RESET}"),
                          interval_s=args.interval * 60, on_failure=fix if args.fix else None)
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+def finish_selftest(repo: Path, jarvis: Jarvis, log: RunLog | None, notifier: notify.Notifier | None = None) -> int:
+    """Check the crew's work in the repository itself and print the verdict."""
+    checks = selftest.verify(repo, jarvis.team.history if jarvis.team else None)
+    summary = selftest.report(checks)
+    passed = all(c.ok for c in checks)
+    print(f"\n{CYAN if passed else RED}{summary}{RESET}")
+    if jarvis.team:
+        print(jarvis.team.status())
+    print(f"{DIM}Repository: {repo}{RESET}")
+    if log:
+        log.section("Self-test", summary)
+        print(f"{DIM}Full run log: {log.path}{RESET}")
+    if notifier:
+        notifier.send("Jarvis self-test " + ("passed" if passed else "FAILED"), summary)
+    return 0 if passed else 1
+
+
+def make_notifier(args: argparse.Namespace) -> notify.Notifier | None:
+    if not getattr(args, "notify", ""):
+        return None
+    return notify.Notifier(args.notify, report=lambda m: print(f"{DIM}{m}{RESET}", file=sys.stderr))
+
+
+def run_issues(args: argparse.Namespace, jarvis: Jarvis, notifier: notify.Notifier | None) -> int:
+    try:
+        ledger = autopilot.Ledger(args.workspace.parent / "autopilot.json")
+    except autopilot.LedgerError as err:
+        print(f"Issue autopilot: {err}", file=sys.stderr)
+        return 1
+
+    def work(issue: autopilot.Issue) -> str | None:
+        jarvis.reset()
+        if jarvis.token_budget is not None:
+            jarvis.token_budget.reset()  # each issue gets the full --token-budget; --budget stays session-wide
+        reply = run_turn(jarvis, autopilot.issue_prompt(issue))
+        if jarvis.team:
+            print(jarvis.team.status())
+        return reply
+
+    print(f"{CYAN}Issue autopilot:{RESET} working issues labelled '{args.label}' in {', '.join(args.issues)} "
+          f"every {args.interval:g} min, {args.per_poll} per round. Ledger: {ledger.path}. Ctrl+C stops.")
+    try:
+        autopilot.autopilot_loop(args.issues, args.label, ledger, work,
+                                 report=lambda m: print(f"{DIM}{time.strftime('%H:%M')} {m}{RESET}"),
+                                 notify=notifier.send if notifier else None,
+                                 interval_s=args.interval * 60, per_poll=args.per_poll,
+                                 any_author=getattr(args, "any_author", False))
     except KeyboardInterrupt:
         print()
     return 0
@@ -585,12 +718,17 @@ def run(args: argparse.Namespace, io: VoiceIO | None, listener: wake.WakeWordLis
                 approve=make_approver(args.yes or args.auto),
                 memory=None if args.no_memory else Memory(args.workspace.parent / "memory.md"),
                 confirm_private=make_approver(False),  # screenshots always ask; refused when nobody can answer
+                sandbox=getattr(args, "sandbox_box", None),
             ),
             mcp=mcp,
             model=args.model,
             effort=args.effort,
             voice_mode=io is not None,
             autonomous=args.auto,
+            team_mode=args.team,
+            team_models=args.team_models,
+            sentinel_mcp=frozenset(n.strip() for n in getattr(args, "sentinel_mcp", "").split(",") if n.strip()),
+            token_budget=TokenBudget(args.token_budget) if args.token_budget else None,
             max_steps=args.max_steps or (AUTO_MAX_STEPS if args.auto else DEFAULT_MAX_STEPS),
             on_text=show_text,
             on_delta=show_delta,
@@ -603,15 +741,20 @@ def run(args: argparse.Namespace, io: VoiceIO | None, listener: wake.WakeWordLis
         return 2
     if log:
         log.jarvis = jarvis
+    if jarvis.team:
+        print(f"{CYAN}Team mode:{RESET} Jarvis leads Scout, Architect, Medic, Forge, Sentinel and Herald. /team shows the crew.")
     if args.auto:
         print(f"{RED}Autonomous mode:{RESET} Jarvis will edit, run commands, commit and open draft PRs without asking. "
               f"Destructive commands are blocked, and it never pushes the default branch or merges. Ctrl+C stops it.")
         print(f"{DIM}Run log: {log.path}{RESET}" if log else "")
 
+    notifier = make_notifier(args)
+    if args.issues:
+        return run_issues(args, jarvis, notifier)
     if args.web:
         return run_web(args, jarvis)
     if args.watch is not None:
-        return run_watch(args, jarvis, io, log)
+        return run_watch(args, jarvis, io, log, notifier)
 
     if args.brief is not None:
         try:
@@ -627,6 +770,13 @@ def run(args: argparse.Namespace, io: VoiceIO | None, listener: wake.WakeWordLis
         reply = run_turn(jarvis, goal) if io is None else talk_turn(jarvis, io, goal)
         if log:
             log.finish(reply is not None, reply)
+        if log and jarvis.team:
+            log.crew(jarvis.team.status())
+        if args.selftest_repo is not None:
+            return finish_selftest(args.selftest_repo, jarvis, log, notifier)
+        if notifier and args.auto:
+            notifier.send("Jarvis finished" if reply is not None else "Jarvis stopped with an error",
+                          (reply or "See the run log.") + (f"\n\nRun log: {log.path}" if log else ""))
         return 0 if reply is not None else 1
 
     if io and listener:

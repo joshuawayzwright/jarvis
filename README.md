@@ -118,7 +118,171 @@ Every run is logged to `~/.jarvis/runs/<timestamp>.md`: the goal, each tool call
 - `--max-steps` caps the run (default 250 in auto mode, 60 otherwise). Ctrl+C stops it at any time.
 - `--budget 5` caps spending: Jarvis estimates the cost of each request from its token usage at list price, warns at 80% of the limit and stops before the next request once the limit is reached. The unfinished request is rolled back from the conversation (files it already changed stay changed), and the run is marked **over budget**. It works for Claude Fable 5.2, Opus 5.5, Sonnet 5.5 and Haiku 5.5; it's an estimate, so set it with some margin and keep your Console spend limits as the real cap.
 
-> **Run it somewhere disposable.** Autonomous mode runs commands from repositories it pulls, including their install scripts and tests, without asking. Use a container, VM or cloud dev box rather than your main machine, and a GitHub token limited to the repositories you want it to change.
+> **Run it somewhere disposable, or use `--sandbox`.** Autonomous mode runs commands from repositories it pulls, including their install scripts and tests, without asking. Use `--sandbox` (below), or a container, VM or cloud dev box rather than your main machine. Either way, use a GitHub token limited to the repositories you want it to change.
+
+### Sandboxed commands
+
+```bash
+jarvis --team --auto --sandbox "..."                  # or JARVIS_SANDBOX=1
+jarvis --issues acme/api --sandbox --sandbox-network none
+```
+
+With `--sandbox`, every `run_command`, Jarvis's own and every specialist's, runs in a fresh Docker container that is removed afterwards:
+
+- **It sees only the repository**, mounted at `/work`, with **`.git` read-only**, so code can't add hooks, change git config or move refs. It never sees your home directory, SSH keys or environment variables, so `GITHUB_TOKEN` and `ANTHROPIC_API_KEY` stay out.
+- **It's locked down:** it runs as your user ID, so files it creates are yours. Every Linux capability is dropped, `no-new-privileges` is set, and memory, CPU and process count are limited (4 GB, 2 CPUs, 512 processes).
+- **Installs are cached per repository** in `~/.jarvis/sandbox-home/<repo>`, the container's home folder, so `pip install --user` or npm caches survive between commands.
+- **Network:** `bridge` by default, so dependencies install; `--sandbox-network none` cuts it off completely.
+- **Image:** `node:22-bookworm` by default (Node 22, Python 3, git, make and a C toolchain). Change it with `--sandbox-image` or `JARVIS_SANDBOX_IMAGE`. Jarvis pulls it on first use.
+- **Timeouts kill the container**, not just the client.
+- **What stays on the host:** the blocked-command list is still checked first, and Jarvis's own git operations (commit, push) still run on the host with the token only Jarvis holds.
+
+It needs Docker (Docker Desktop, or Engine on Linux). If Docker isn't running, Jarvis says so and exits rather than falling back to running commands on your machine.
+
+## Team mode: Jarvis and six specialists
+
+With `--team`, Jarvis becomes the chief of a seven-agent crew. It plans, hands work to six specialists, checks what they report and tells you the outcome. Each specialist is its own Claude agent with its own instructions and a restricted set of tools.
+
+| Agent | Role | Tools | Runs |
+|---|---|---|---|
+| **Jarvis** (chief) | Plans, delegates, checks reports, remembers, reports to you | Read-only GitHub and local tools, CI status, memory, `delegate` | |
+| **Scout** | Research: prior art across GitHub, library docs, license checks | Remote GitHub search and reads, read-only MCP tools | In parallel |
+| **Architect** | Design: reads the target repository and writes a file-by-file plan with a test plan | Remote and local reads | In parallel |
+| **Medic** | CI and operations: diagnoses failing builds and repository health | `github_activity`, `get_ci_failure`, reads | In parallel |
+| **Forge** | Build: edits code, installs dependencies, builds and runs tests | Reads, `write_file`, `edit_file`, `run_command` | One at a time |
+| **Sentinel** | QA and security: reviews the diff, runs tests and linters, ends with `VERDICT: PASS` or `FAIL` | Reads, test edits, `run_command`, all MCP tools (e.g. a browser) | One at a time |
+| **Herald** | Ship: updates docs, commits on a feature branch, opens the draft PR | Reads, docs edits, `commit_changes`, `push_and_open_pr` | One at a time |
+
+```bash
+jarvis --team                                    # interactive; /team shows the crew and the quality gate
+jarvis --team --auto "Add rate limiting to acme/api"
+jarvis --team --watch --fix                      # the crew fixes broken builds
+export JARVIS_TEAM=1                             # make team mode the default
+```
+
+How the crew works:
+
+- **Delegation.** Jarvis calls `delegate(agent, task)` with everything the specialist needs, including findings from the others. Specialists don't see each other's reports unless Jarvis passes them on.
+- **Parallel recon.** When Jarvis delegates to several of Scout, Architect and Medic in one step, they run at the same time. Forge, Sentinel and Herald change things, so they run one at a time, and two assignments for the *same* specialist always queue. Ctrl+C during a parallel step returns at once; the specialists stop before their next request.
+- **Failures stay contained.** A specialist that crashes, for example because the API is down, is rolled back to its last valid conversation, so its next assignment works. If Forge or Sentinel crashes, the gate is marked unverified.
+- **Memory per specialist.** Each specialist keeps its conversation across assignments in a session, so "now fix issue 2" works. Jarvis can pass `fresh: true` to start one over; `/reset` clears everyone.
+- **Quality gate, enforced on the code itself.** Jarvis fingerprints a repository by hashing every file except documentation, committed or not.
+  - `commit_changes` checks the files about to be committed; `push_and_open_pr` checks the commit actually being pushed (HEAD), not the files on disk.
+  - Either goes through only when the fingerprint matches the default branch (only docs changed) or code that Sentinel passed.
+  - If code changes after verification by *any* route, it no longer matches and shipping is refused until Sentinel verifies again. Routes include a `sed` in `run_command`, an MCP tool, a run that crashed halfway, or edits left over after `/reset`.
+  - **The base is pinned.** Before a specialist that can change things first touches a repository, Jarvis records its default branch from the repository's *canonical* GitHub URL. It never uses the local `origin` setting, which code in the repository could rewrite. Moving a local ref or rewriting `origin` afterwards can't make new code look like the base. If GitHub can't be reached at that moment, the pin comes from local refs and is marked local: commits are fine, but a push first needs a pin read from GitHub.
+  - **Herald pushes to the canonical URL**, never to wherever `origin` points. All gate state is keyed by the canonical repository name, so `acme/api`, `acme/api.git` and `https://github.com/acme/api` are one repository.
+  - On `FAIL`, Jarvis sends the issues back to Forge and verifies again, up to three rounds.
+- **A PASS needs proof.** Sentinel's report must end with `VERDICT: PASS`, and the verdict counts only if, in that same assignment:
+  - a command that *invokes* a real test, lint or type-check runner exited 0. Examples: `pytest`, `python -m unittest`, `npm test`, `go test`, `cargo test`, `make check`, `ruff check`, `tsc`, or a project script such as `./scripts/test.sh`. It must be the last command, joined only by `&&`, as in `pip install -e . && pytest`. These don't count:
+    - commands that only mention a runner (`echo pytest`, `cat tests/x.py`) or print its version or test list (`--version`, `--collect-only`, `--if-present`);
+    - installs, or `cd` out of the repository;
+    - anything whose failure is hidden by `; true`, `|| true` or a pipe;
+  - Sentinel left the application code alone. Its edits are limited to tests, and a PASS from a Sentinel that changed non-test code is rejected;
+  - the check ran on *exactly* the code present when Sentinel finished;
+  - Sentinel ended normally. A PASS from a run cut short by the step limit or the budget is ignored.
+- **Scoped writes.** Sentinel can write only test files, recognised by name (`test_*.py`, `*_test.go`, `*.test.ts`, `*.spec.js`, `*_spec.rb` and similar). Herald can write only documentation (README, CHANGELOG, `*.md`, `*.rst`, Markdown and images under `docs/`). Test *infrastructure* can change what a test run reports, so it counts as code: Sentinel can't edit it and the gate fingerprints it. That covers `conftest.py`, helpers, fixtures, scripts in `tests/` and runner config. Paths are normalised first, so `tests/../src/app.py` is refused. `.mdx` files and `docs/requirements.txt` count as code. Specialists can't run git commands that commit, push or move refs (`commit`, `push`, `reset`, `stash`, `fetch`, `pull`, `branch`, `checkout`, `switch`, `symbolic-ref` and similar) through `run_command`; `status`, `diff`, `log` and `show` are fine. That rule is a speed bump; the pinned base and the HEAD check are what actually stop a disguised command. Only Forge changes application code.
+- **MCP tools.** The chief and the specialists get only the MCP tools their servers mark read-only. `--sentinel-mcp playwright` (or `JARVIS_SENTINEL_MCP`) also gives Sentinel the write tools of the servers you name, for example a browser to click through a UI. The fingerprint gate still covers anything those tools change in the repository.
+- **Jarvis's own git calls ignore repository hooks and `core.fsmonitor`.** Code in a repository can't run inside Jarvis's commit or push. `run_command` doesn't see environment variables that look like secrets (`GITHUB_TOKEN`, `*_API_KEY`, `*SECRET*`, `*PASSWORD*` and similar).
+- **Known limit: gitignored files.** The fingerprint follows `.gitignore`, so a file it ignores (`.env`, `local_settings.py`, a patched `node_modules`) can make Sentinel's tests pass locally without being shipped. The PR then fails CI instead of being wrong silently, but review a PR that depends on local configuration with that in mind.
+- **Separation of duties.** Jarvis can't edit, run commands or ship in team mode, and every specialist is limited to its own tools: a call outside them is refused.
+- **Approvals.** Without `--yes` or `--auto`, each write, command and push still asks you, labelled with the specialist that wants it (`[Forge] Run in acme/api: pytest`). Approval prompts never overlap.
+- **Visibility.** Specialists' tool calls appear in the terminal, web page and run log, prefixed with their name (`Scout ▸ search_github_code ...`).
+
+### What the gate does and doesn't protect against
+
+- **It guarantees** that what Herald ships is the code Sentinel checked, and that Sentinel's PASS came from a real check that ran on that code and exited 0. Mistakes and confusion can't bypass it, and neither can a specialist cutting corners or later edits made by any route.
+- **It trusts Sentinel's judgement.** A Sentinel that runs only a trivial test still "verifies" the code. That's why every result is a draft PR for you to review, why the autopilot works only maintainers' issues by default, and why the PR's own CI runs the real suite.
+- **Without `--sandbox`, repository code runs as you.** A hostile repository's install script or tests can do anything your user account can, including bypassing Jarvis entirely: reading your git credentials, or pushing with them. Use `--sandbox` for repositories or issues you don't fully trust. Inside the sandbox, code sees only the repository, gets no secrets, and `.git` is read-only, so it can't touch hooks, config or refs.
+
+### Models and cost
+
+A team run makes more API calls than a solo run, because each specialist reads the code it works on. Every specialist uses Jarvis's model (`--model`) unless you choose another with `--team-models`. Each also has an effort level that fits its role: `medium` for Scout, Medic and Herald, `high` for the rest.
+
+```bash
+jarvis --team-models economy "..."                          # Scout, Medic and Herald on claude-sonnet-5-5
+jarvis --team-models "economy,forge=claude-sonnet-5-5" "..."  # presets and overrides combine
+export JARVIS_TEAM_MODELS="scout=claude-haiku-5-5"
+```
+
+`--team-models` turns on team mode. Keep Forge and Sentinel on your strongest model: they write and judge the code.
+
+`/team` shows each agent's model, assignments, API requests and tokens used this session (input includes prompt-cache reads and writes). Autonomous runs write the same table to the end of the run log. With `--budget` set, it also shows the estimated dollars spent by the whole team against the limit.
+
+**Spending caps.** Two limits cover Jarvis and every specialist together, and both work in solo mode too:
+
+- `--budget 5` is a **dollar** limit, from the estimated cost of every agent's tokens at its model's list price. It warns at 80% and stops before going over. With `--team-models`, every specialist model needs a known price, or Jarvis refuses to start.
+- `--token-budget 1.5M` (or `JARVIS_TOKEN_BUDGET`) is a **token** limit that counts input, cache and output tokens.
+
+```bash
+jarvis --team --auto --budget 5 "..."             # stop at about US$5 for the whole team
+jarvis --team --auto --token-budget 1.5M "..."     # or a token cap: 500000, 500k, 2M
+```
+
+- Every token counts toward the cap: input, prompt-cache reads and writes, and output. That's deliberately conservative, because cache reads cost much less than fresh input.
+- Each agent checks the budget before each request. A specialist that hits the cap stops and reports what it has. Jarvis then stops before its next request and tells you how much was used. A request already in progress finishes, so a run can go over the cap by up to one response per agent working at that moment, at most three in a parallel step.
+
+### Crew panel in the browser
+
+In team mode, `jarvis --web --team` adds a crew panel above the chat. It shows:
+
+- each agent's status: working (pulsing), done, error or idle;
+- each agent's latest result, or Sentinel's verdict;
+- tasks and tokens per agent;
+- the quality-gate state;
+- a token meter, when `--token-budget` is set.
+
+The panel refreshes every 2 seconds. On a phone it starts collapsed to a one-line summary (gate, who's working, budget); tap it to see the agents. It reads `GET /api/team`, which needs the same token as the rest of the page.
+
+### Self-test
+
+`--selftest` checks, end to end and with real API calls, that team mode works with your key, models and MCP setup:
+
+```bash
+jarvis --selftest                              # capped at 2M tokens
+jarvis --selftest --team-models economy --token-budget 1M
+```
+
+1. Jarvis creates a small local repository (`selftest/stats`) under `~/.jarvis/selftest/<time>/`. It has a planted bug and a failing test, and no remote.
+2. The crew gets one autonomous goal: find the bug, fix it, verify it, and commit on a feature branch without pushing. It works in `--auto` mode, so its writes, commands and commits run without asking you, all inside that folder.
+3. Jarvis then checks the result itself, without relying on the crew's reports:
+   - the fix is on a feature branch and `main` is untouched;
+   - the working tree is clean;
+   - the suite passes;
+   - **the original tests pass on the new code**, so deleting or weakening a test can't fake a pass;
+   - the run went Forge → Sentinel → Herald, so the quality gate was exercised.
+
+It prints `SELF-TEST PASSED` or `FAILED` with each check and the crew table, and exits 0 or 1. The full run log is in the same folder. The self-test needs no GitHub token, and it uses its own memory file, so your notes are left alone.
+
+## Issue autopilot and notifications
+
+**Hand Jarvis an issue by labelling it.** The crew works each open issue labelled `jarvis` and opens a draft pull request that starts with `Closes #N`:
+
+```bash
+jarvis --issues acme/api acme/web                       # checks every 5 minutes, one issue per round
+jarvis --issues acme/api --label ai-ready --per-poll 2 --interval 15 --token-budget 2M --budget 20
+```
+
+- **The label is the permission.** On GitHub only people with triage access or higher can add labels, so the crew only works issues a maintainer has approved.
+- **Only maintainers' issues, by default.** Authors can still edit an issue after it is labelled, so by default the autopilot works only issues opened by the repository's owners, members and collaborators. It records and skips others; `--any-author` includes them.
+- **Issue text is still treated as data.** The crew reads it as a description of the change, not as instructions about how Jarvis operates. It ignores requests to reveal secrets or to change credentials, CI, permissions or settings. If an issue is unclear, unsafe, or not a code change, the crew changes nothing and explains why.
+- **Each issue is worked once.** `~/.jarvis/autopilot.json` records every issue when it starts (`started`, then `done`, `failed` or `skipped`), so a restart never repeats work or spends twice. Delete an entry to retry that issue. If the file is unreadable, the autopilot refuses to start rather than guess. Every labelled open issue is read, across all pages.
+- **Every safeguard of team mode applies.** That includes the evidence-backed quality gate, draft PRs only, `--token-budget`, which applies to *each issue*, and `--budget`, which caps the dollars spent across the whole run. An issue that crashes is recorded and the autopilot moves on.
+
+**Get told when work finishes.** `--notify URL` (or `JARVIS_NOTIFY`) sends a summary when one of these finishes: an autonomous run, a self-test, a watch-mode fix or an autopilot issue.
+
+| URL | Sent as |
+|---|---|
+| `https://ntfy.sh/<your-topic>` (or your own ntfy server) | Phone push notification, with the title in a header |
+| `https://hooks.slack.com/services/...` | Slack message (`{"text": ...}`) |
+| `https://discord.com/api/webhooks/...` | Discord message (`{"content": ...}`) |
+
+```bash
+export JARVIS_NOTIFY=https://ntfy.sh/my-jarvis-7f3k   # pick a hard-to-guess topic: ntfy topics are public
+jarvis --issues acme/api
+```
+
+Only the summary is sent, capped at 1,800 characters. URLs must use `https://`; `http://` is accepted only for localhost. A failed notification is reported and never stops the run.
 
 ## Plug in tools from GitHub (MCP)
 
@@ -250,7 +414,7 @@ Jarvis keeps long-term notes in `~/.jarvis/memory.md`: your preferences, your re
 ## Usage
 
 ```bash
-jarvis                                   # interactive (/reset, /memory, /tools, /exit)
+jarvis                                   # interactive (/reset, /memory, /tools, /team, /exit)
 jarvis "what changed in octocat/Hello-World this month?"   # one question, then exit
 jarvis --yes "pull acme/api and run its tests"             # auto-approve writes and commands
 jarvis --effort medium --model claude-sonnet-5-5 "..."     # cheaper and faster
@@ -263,12 +427,20 @@ jarvis --effort medium --model claude-sonnet-5-5 "..."     # cheaper and faster
 | `--effort` | `high` | Reasoning depth: `low` to `max` |
 | `-y`, `--yes` | off | Approve edits, commands, commits and pushes without asking |
 | `--auto` | off | Autonomous mode (implies `--yes`) |
+| `--team`, `JARVIS_TEAM=1` | off | Team mode: Jarvis leads six specialist agents |
+| `--team-models`, `JARVIS_TEAM_MODELS` | `--model` for all | Models per specialist, or `economy` |
+| `--sentinel-mcp`, `JARVIS_SENTINEL_MCP` | none | MCP servers whose write tools Sentinel may use (e.g. `playwright`) |
+| `--token-budget`, `JARVIS_TOKEN_BUDGET` | no cap | Stop after this many tokens across all agents (`500k`, `2M`) |
+| `--selftest` | | Live end-to-end team check on a local repository with a planted bug |
+| `--issues REPO ...`, `--label`, `--per-poll` | `jarvis`, 1 | Issue autopilot: the crew works labelled issues into draft PRs |
+| `--notify`, `JARVIS_NOTIFY` | off | ntfy, Slack or Discord message when a run finishes |
+| `--sandbox`, `--sandbox-image`, `--sandbox-network` | off, `node:22-bookworm`, `bridge` | Run commands in a locked-down Docker container |
 | `--mcp-config` | `~/.jarvis/mcp.json` | MCP servers to start |
 | `--no-mcp`, `--no-memory` | off | Turn off MCP servers or long-term memory |
 | `--brief [OWNER]` | | Morning briefing across your repositories |
 | `--watch [TARGET ...]`, `--interval`, `--fix` | 5 min | Watch default-branch builds; optionally auto-fix. With `--web`, feeds the dashboard |
 | `--web`, `--web-host`, `--web-port`, `--web-cert`, `--web-key` | localhost:8765 | Browser and phone interface |
-| `--budget USD` | none | Spending limit for the session, from the estimated cost at list price. Warns at 80% and stops before going over |
+| `--budget USD` | none | Spending limit for the session (the whole team in team mode), from the estimated cost at list price. Warns at 80% and stops before going over |
 | `--max-steps` | 60, or 250 with `--auto` | Agent steps per request |
 
 When stdin is not a terminal (in scripts or CI, for example), writes and commands are **denied** unless you pass `--yes`.
@@ -333,6 +505,7 @@ Each spoken reply is capped at about 1,500 characters, which also limits ElevenL
 ## How it works
 
 - **Agent loop** (`jarvis/agent.py`): a manual tool-use loop on the Messages API, with adaptive thinking, prompt caching of the conversation prefix, and server-side refusal fallbacks (`fallbacks: "default"`). All tool results for one turn go back in a single message. The loop stops after 40 steps.
+- **Team** (`jarvis/team.py`): the six specialist roles, their prompts and tool allowlists, parallel delegation on a thread pool, and the quality gate, applied as middleware on every specialist tool call.
 - **Tools** (`jarvis/tools.py`): every tool input is checked against its schema before it runs. File paths are resolved and confined to the repository, and writes into `.git` are refused. Output is capped so large files and searches don't flood the context.
 - **Wake word** (`jarvis/wake.py`): openWakeWord scores each 80 ms microphone frame for "hey Jarvis". A loudness-based end-of-speech detector, calibrated to the room's background noise, decides when you have finished talking.
 - **Voice** (`jarvis/voice.py`): push-to-talk recording with `sounddevice`, local transcription with faster-whisper, and speech output through pyttsx3 or ElevenLabs. In voice mode the system prompt asks Claude for short, speakable replies and to allow for transcription errors.

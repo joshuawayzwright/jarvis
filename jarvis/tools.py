@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import subprocess
 from collections.abc import Callable
@@ -36,6 +37,8 @@ class ToolContext:
     memory: Memory | None = None
     # Asks the person in front of the screen even when other tools are auto-approved (--yes, --auto).
     confirm_private: Approver | None = None
+    # Runs run_command inside a Docker container instead of on this machine (--sandbox).
+    sandbox: Any = None
 
 
 def _str(description: str) -> dict[str, object]:
@@ -534,7 +537,7 @@ BLOCKED_COMMANDS = [
     (re.compile(r"\b(mkfs|fdisk|diskpart|shutdown|reboot|halt|poweroff)\b|\bdd\s+if="), "disk or system commands"),
     (re.compile(r":\(\)\s*\{"), "fork bombs"),
     (re.compile(r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z)?sh\b"), "piping downloads into a shell"),
-    (re.compile(r"\bgit\s+push\b"), "git push (use push_and_open_pr, which never pushes the default branch)"),
+    (re.compile(r"\bgit\b(?:\s+(?:-[cC]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+push\b"), "git push (use push_and_open_pr, which never pushes the default branch)"),
     (re.compile(r"\bgit\s+(reset\s+--hard\s+origin|clean\s+-\w*f\w*d)"), "destructive git resets"),
     (re.compile(r"\bgh\s+(repo\s+delete|pr\s+merge|release\s+delete)\b"), "deleting repos, merging or deleting releases"),
 ]
@@ -547,16 +550,32 @@ def blocked_reason(command: str) -> str | None:
     return None
 
 
+_SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|AUTH", re.IGNORECASE)
+
+
+def scrubbed_env() -> dict[str, str]:
+    """The environment for repository commands, minus anything that looks like a secret (GITHUB_TOKEN,
+    ANTHROPIC_API_KEY, AWS_SECRET_ACCESS_KEY ...), so code from a repository can't use or leak Jarvis's keys."""
+    env = {k: v for k, v in os.environ.items() if not _SECRET_NAME.search(k)}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 def run_command(ctx: ToolContext, repo: str, command: str, timeout_seconds: int = 120) -> str:
     root = repo_dir(ctx, repo)
     reason = blocked_reason(command)
     if reason:
         raise ToolError(f"Blocked for safety: {reason}. Find another way to do this.")
     timeout = max(10, min(timeout_seconds, 900))
-    if not ctx.approve(f"Run in {repo}: {command}"):
+    where = f"{repo} (sandbox: {ctx.sandbox.image})" if ctx.sandbox is not None else repo
+    if not ctx.approve(f"Run in {where}: {command}"):
         return "The user declined this command."
     try:
-        result = subprocess.run(command, shell=True, cwd=root, capture_output=True, text=True, timeout=timeout)
+        if ctx.sandbox is not None:
+            result = ctx.sandbox.run(root, repo, command, timeout)
+        else:
+            result = subprocess.run(command, shell=True, cwd=root, capture_output=True, text=True, timeout=timeout,
+                                    env=scrubbed_env())
     except subprocess.TimeoutExpired:
         return f"Command timed out after {timeout} seconds."
     output = f"exit code {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
@@ -597,5 +616,5 @@ def execute(ctx: ToolContext, name: str, raw_input: object) -> tuple[Any, bool]:
         return HANDLERS[name](ctx, **args), False
     except (ToolError, GitHubError) as err:
         return f"Error: {err}", True
-    except OSError as err:
+    except (OSError, ValueError) as err:  # ValueError covers UnicodeDecodeError on binary files
         return f"Error: {err}", True
