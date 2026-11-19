@@ -320,6 +320,7 @@ PAGE = r"""<!doctype html>
   .error { color:var(--warn); }
   .notice { border-color:var(--warn); color:var(--muted); font-size:14px; }
   pre { background:var(--code); padding:10px; border-radius:8px; overflow-x:auto; white-space:pre; margin:6px 0; font-size:14px; }
+  .msg code { background:var(--code); padding:1px 5px; border-radius:5px; font-size:.92em; }
   .approval { border-color:var(--warn); }
   .approval div { margin-top:8px; display:flex; gap:8px; }
   form { display:flex; gap:8px; padding:12px 16px calc(12px + env(safe-area-inset-bottom)); border-top:1px solid var(--line); background:var(--panel); }
@@ -354,11 +355,40 @@ if (asked) { document.getElementById("input").value = asked; history.replaceStat
 const api = (path, body) => fetch(path, {method: "POST", headers: {"Content-Type": "application/json", "X-Jarvis-Token": token}, body: JSON.stringify(body || {})});
 
 function add(cls, text) { const el = document.createElement("div"); el.className = cls; el.textContent = text || ""; log.appendChild(el); log.scrollTop = log.scrollHeight; return el; }
-function render(el, text) {           // code blocks as <pre>, everything else as plain text (never innerHTML)
+// Light Markdown: **bold**, *italic*, _italic_, `code`, https links, "- " bullets and "#" headings.
+// Built from DOM nodes and textContent only (never innerHTML), so model text can't inject markup.
+// Unclosed markers (common mid-stream) stay as plain text until the closing marker arrives.
+const INLINE = /(`[^`\n]+`)|\*\*([^*\n]+?)\*\*|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(?<![\w*])\*(?![\s*])([^*\n]+?)(?<!\s)\*(?![\w*])|(?<![\w])_(?![\s_])([^_\n]+?)(?<!\s)_(?![\w])/g;
+function inline(parent, text) {
+  const re = new RegExp(INLINE.source, "g");   // own copy: the bold branch recurses, and a shared lastIndex would loop
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) parent.appendChild(document.createTextNode(text.slice(last, m.index)));
+    let node;
+    if (m[1]) { node = document.createElement("code"); node.textContent = m[1].slice(1, -1); }
+    else if (m[2] !== undefined) { node = document.createElement("strong"); inline(node, m[2]); }
+    else if (m[3] !== undefined) { node = document.createElement("a"); node.href = m[4]; node.target = "_blank"; node.rel = "noopener noreferrer"; node.textContent = m[3]; }
+    else { node = document.createElement("em"); node.textContent = m[5] !== undefined ? m[5] : m[6]; }
+    parent.appendChild(node);
+    last = re.lastIndex;
+  }
+  if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+}
+function prose(el, text) {
+  text.split("\n").forEach((line, i) => {
+    if (i) el.appendChild(document.createTextNode("\n"));
+    const heading = line.match(/^#{1,6}\s+(.*)$/);
+    if (heading) { const s = document.createElement("strong"); inline(s, heading[1]); el.appendChild(s); return; }
+    const bullet = line.match(/^(\s*)[-*+]\s+(.*)$/);
+    if (bullet) { el.appendChild(document.createTextNode(bullet[1] + "• ")); inline(el, bullet[2]); return; }
+    inline(el, line);
+  });
+}
+function render(el, text) {           // code blocks as <pre>, the rest as light Markdown (never innerHTML)
   el.textContent = "";
   text.split(/```[^\n]*\n?/).forEach((part, i) => {
     if (i % 2) { const pre = document.createElement("pre"); pre.textContent = part.replace(/\n$/, ""); el.appendChild(pre); }
-    else if (part) el.appendChild(document.createTextNode(part));
+    else if (part) prose(el, part);
   });
 }
 
