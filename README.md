@@ -377,7 +377,12 @@ Add `--watch` to get a live dashboard next to the chat. Jarvis prints its link (
 ```bash
 jarvis --web --watch                              # your account's repositories active in the last 30 days
 jarvis --web --watch my-org acme/api --interval 10
+jarvis --web --watch --auto --budget 5 --brief-daily 08:00   # also start runs from the page, and a briefing every morning
 ```
+
+- **Briefing:** the morning briefing (what `--brief` prints) as a card at the top: failing CI, pull requests waiting for review and new issues. **Generate** makes one now; `--brief-daily 08:00` makes a fresh one each day at that local time, and the last one is kept in `~/.jarvis/briefing.json` across restarts. The briefing's agent is read-only: it declines every write, command, commit and push.
+- **Start a run:** type a goal under *Autonomous runs* and press **Start run**. It works through the goal like `jarvis --auto` (in team mode with `--team`), in the background so the chat stays free, and shows up in the run list with a live log. This box appears only when the web server was started with `--auto`, so whoever starts Jarvis decides whether the page may act without asking. One job (run or briefing) runs at a time.
+- **Spending:** estimated cost per day for the last 14 days across everything Jarvis did on this machine: chat, runs, briefings, CLI sessions and every team-mode specialist. Hover a bar for the day's split, or open it as a table. Each request is recorded in `~/.jarvis/spend.jsonl`, one line per request.
 
 - **CI on default branches:** every watched repository with the latest result of each workflow, failing ones first, and links to the run logs. Each workflow shows its last 10 results and pass rate, so you can see a flaky workflow from one that is newly broken. Jarvis checks every `--interval` minutes; **Check now** checks at once.
 - **Open pull requests:** across the watched repositories, most recently updated first, with drafts marked.
@@ -387,7 +392,7 @@ jarvis --web --watch my-org acme/api --interval 10
 - **Autonomous runs:** the latest 10 runs started with `--auto` or `--watch --fix`, from any session: goal, status (running, done, failed, or stalled when a run stopped updating for 30 minutes), steps, tool errors, estimated cost, pull requests opened, and the log file name in `~/.jarvis/runs/`.
 - **Session:** model, effort, approval mode, tools (including MCP), whether Jarvis is working, tokens used this session (input, output and cached) and their **estimated cost**.
 - **Run logs:** **Show log** on any run opens its full log in place (the last 200 KB of a very long one). A running run's log updates as it goes.
-- **Spending limit:** with `--budget`, the cost tile shows how much of the limit is used.
+- **Spending limit:** with `--budget`, the cost tile shows how much of the chat's limit is used. Each run and briefing started from the page gets its own `--budget` limit, not a share of the chat's.
 - **Notifications:** tap 🔔 to get a browser notification when a build breaks or recovers while the dashboard is open. Browsers allow this only over HTTPS or on `localhost`, as with the microphone. The tab title also shows how many workflows are failing.
 - **Memory:** the most recent long-term notes.
 
@@ -395,7 +400,7 @@ Cost estimates use Anthropic's list prices for Claude Fable 5.2, Opus 5.5, Sonne
 
 **Add it to your phone's home screen** to open the dashboard like an app: in Safari, Share → *Add to Home Screen*; in Chrome, ⋮ → *Add to Home screen* (or *Install app*). It opens full screen with the Jarvis icon. The home-screen shortcut contains your secret token, like the printed link, and stops working when Jarvis restarts with a new token.
 
-The dashboard reads GitHub through your `GITHUB_TOKEN` (two requests per repository per check) and never calls Claude, so viewing it costs no tokens. It refreshes every 15 seconds while open. Without `--watch`, it shows the session and memory panels only. `--fix` is terminal-only; on the web, use the Fix with Jarvis button.
+The dashboard reads GitHub through your `GITHUB_TOKEN` (two requests per repository per check). Viewing it costs no tokens; only a briefing (Generate or `--brief-daily`) and runs you start call Claude. It refreshes every 15 seconds while open. Without `--watch`, the CI, pull request and alert panels are off; the briefing, runs, spending, session and memory panels still work. `--fix` is terminal-only; on the web, use the Fix with Jarvis button.
 
 ## Screen vision
 
@@ -438,6 +443,7 @@ jarvis --effort medium --model claude-sonnet-5-5 "..."     # cheaper and faster
 | `--mcp-config` | `~/.jarvis/mcp.json` | MCP servers to start |
 | `--no-mcp`, `--no-memory` | off | Turn off MCP servers or long-term memory |
 | `--brief [OWNER]` | | Morning briefing across your repositories |
+| `--brief-daily HH:MM` | off | With `--web`: a fresh briefing on the dashboard each day at this local time |
 | `--watch [TARGET ...]`, `--interval`, `--fix` | 5 min | Watch default-branch builds; optionally auto-fix. With `--web`, feeds the dashboard |
 | `--web`, `--web-host`, `--web-port`, `--web-cert`, `--web-key` | localhost:8765 | Browser and phone interface |
 | `--budget USD` | none | Spending limit for the session (the whole team in team mode), from the estimated cost at list price. Warns at 80% and stops before going over |

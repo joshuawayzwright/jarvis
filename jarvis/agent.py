@@ -68,9 +68,12 @@ class Spend:
     The cost is worked out from each agent's own usage totals at its own model's list price, so it always
     matches the per-agent figures and nothing is counted twice."""
 
-    def __init__(self) -> None:
+    def __init__(self, ledger: Any = None, kind: str = "chat") -> None:
         self._agents: list[Any] = []
         self._lock = threading.Lock()
+        # Optional SpendLedger: every agent sharing this Spend logs each request's cost there, under `kind`.
+        self.ledger = ledger
+        self.kind = kind
 
     def join(self, agent: Any) -> None:
         with self._lock:
@@ -259,6 +262,8 @@ class Jarvis:
             self.usage[name] = self.usage.get(name, 0) + value
         if self.token_budget is not None:
             self.token_budget.add(sum(tokens.values()))
+        if self.spend is not None and self.spend.ledger is not None:
+            self.spend.ledger.record(self.model, tokens, self.spend.kind)
 
     def ask(self, prompt: str) -> str:
         """Send one user turn and run tools until Claude finishes. Returns the final text."""

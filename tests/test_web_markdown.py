@@ -52,9 +52,14 @@ def renderer_source() -> str:
 def test_chat_page_markdown_rendering() -> None:
     script = FAKE_DOM + renderer_source() + r"""
 const cases = JSON.parse(process.argv[1]);
-console.log(JSON.stringify(cases.map(([text]) => { const d = new El("div"); render(d, text); return d.kids.map(k => k.html()).join(""); })));
+console.log(JSON.stringify(cases.map(([text]) => { const d = new El("div"); renderMarkdown(d, text); return d.kids.map(k => k.html()).join(""); })));
 """
     result = subprocess.run(["node", "-e", script, json.dumps(CASES)], capture_output=True, text=True, timeout=30, check=True)
     got = json.loads(result.stdout)
     for (text, want), actual in zip(CASES, got):
         assert actual == want, f"{text!r} rendered as {actual!r}"
+
+
+def test_dashboard_uses_the_same_renderer() -> None:
+    from jarvis.web import DASHBOARD_PAGE
+    assert renderer_source() in DASHBOARD_PAGE and "/*MARKDOWN*/" not in DASHBOARD_PAGE

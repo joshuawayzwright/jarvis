@@ -219,6 +219,15 @@ def make_handler(session: WebSession, token: str, dashboard: Dashboard) -> type[
             if path == "/api/approve":
                 ok = session.answer(str(data.get("id", "")), bool(data.get("approved")))
                 self._json(200 if ok else 404, {"ok": ok})
+            elif path in ("/api/jobs/run", "/api/jobs/briefing"):
+                if dashboard.jobs is None:
+                    self._json(404, {"error": "Jobs aren't available in this session."})
+                    return
+                if path == "/api/jobs/run":
+                    error = dashboard.jobs.start_run(str(data.get("goal", "")))
+                else:
+                    error = dashboard.jobs.start_briefing()
+                self._json(409 if error else 202, {"error": error} if error else {"ok": True})
             elif path == "/api/dashboard/refresh":
                 ok = dashboard.refresh()
                 self._json(200 if ok else 409, {"ok": ok} if ok else {"error": "No repositories are being watched. Start Jarvis with --web --watch."})
@@ -414,7 +423,7 @@ function prose(el, text) {
     inline(el, line);
   });
 }
-function render(el, text) {           // code blocks as <pre>, the rest as light Markdown (never innerHTML)
+function renderMarkdown(el, text) {   // code blocks as <pre>, the rest as light Markdown (never innerHTML)
   el.textContent = "";
   text.split(/```[^\n]*\n?/).forEach((part, i) => {
     if (i % 2) { const pre = document.createElement("pre"); pre.textContent = part.replace(/\n$/, ""); el.appendChild(pre); }
@@ -454,7 +463,7 @@ async function chat(text) {
       let nl;
       while ((nl = buffer.indexOf("\n")) >= 0) {
         const event = JSON.parse(buffer.slice(0, nl)); buffer = buffer.slice(nl + 1);
-        if (event.type === "delta") { if (!bubble) { bubble = add("msg"); full = ""; spoken = ""; fence = false; } full += event.text; render(bubble, full); speakNew(full, false); log.scrollTop = log.scrollHeight; }
+        if (event.type === "delta") { if (!bubble) { bubble = add("msg"); full = ""; spoken = ""; fence = false; } full += event.text; renderMarkdown(bubble, full); speakNew(full, false); log.scrollTop = log.scrollHeight; }
         else if (event.type === "block_end") { if (bubble) speakNew(full, true); bubble = null; }
         else if (event.type === "tool") add("tool", "⚙ " + event.line);
         else if (event.type === "approval") askApproval(event);
@@ -546,10 +555,10 @@ DASHBOARD_PAGE = r"""<!doctype html>
 <title>Jarvis Dashboard</title>
 <style>
   :root { --bg:#f6f7f9; --panel:#ffffff; --text:#14171c; --muted:#5d6673; --accent:#0b6bcb; --line:#dde1e7;
-          --ok:#1a7f4b; --bad:#c2321f; --warn:#b4530f; --chip:#eef1f5; }
+          --ok:#1a7f4b; --bad:#c2321f; --warn:#b4530f; --chip:#eef1f5; --bar:#0b6bcb; }
   @media (prefers-color-scheme: dark) {
     :root { --bg:#0f1216; --panel:#171b21; --text:#e7eaee; --muted:#98a2ae; --accent:#5aa9ff; --line:#2a3039;
-            --ok:#4cc38a; --bad:#ff6b5a; --warn:#f0a35e; --chip:#222831; } }
+            --ok:#4cc38a; --bad:#ff6b5a; --warn:#f0a35e; --chip:#222831; --bar:#3d93ee; } }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
   header { position:sticky; top:0; z-index:1; display:flex; align-items:center; gap:12px; padding:12px 16px;
@@ -615,6 +624,25 @@ DASHBOARD_PAGE = r"""<!doctype html>
   .logbtn { font-size:12px; padding:2px 8px; margin-top:4px; }
   pre.runlog { background:var(--chip); border-radius:8px; padding:10px; margin:6px 0 0; max-height:420px; overflow:auto;
                font-size:12px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; }
+  button.small { font-size:13px; padding:3px 10px; margin-left:8px; }
+  .briefing { white-space:pre-wrap; overflow-wrap:anywhere; font-size:14px; max-height:340px; overflow:auto; }
+  .runform { display:flex; gap:8px; margin-bottom:12px; align-items:flex-start; }
+  .runform textarea { flex:1; font:inherit; font-size:14px; padding:8px; border-radius:10px; border:1px solid var(--line);
+                      background:var(--bg); color:var(--text); resize:vertical; min-height:42px; }
+  .chart { position:relative; }
+  .chart svg { display:block; width:100%; height:auto; overflow:visible; }
+  .chart .axis { stroke:var(--line); stroke-width:1; }
+  .chart .lbl { fill:var(--muted); font-size:10px; }
+  .chart .hit { fill:transparent; cursor:default; }
+  .chart .bar { fill:var(--bar); pointer-events:none; }   /* the column behind it takes the hover */
+  .chart .hit:hover + .bar, .chart .bar.on { opacity:.75; }
+  .tip { position:absolute; pointer-events:none; background:var(--panel); border:1px solid var(--line); border-radius:8px;
+         padding:6px 8px; font-size:12px; box-shadow:0 4px 14px rgba(0,0,0,.12); white-space:nowrap; transform:translate(-50%, -100%); }
+  .spendtable { width:100%; font-size:13px; border-collapse:collapse; margin-top:6px; }
+  .spendtable td, .spendtable th { text-align:left; padding:2px 4px; border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  .spendtable td:last-child, .spendtable th:last-child { text-align:right; }
+  details summary { cursor:pointer; color:var(--muted); font-size:13px; margin-top:6px; }
+  .tag.brief { color:var(--accent); border-color:var(--accent); }
   .meter { height:6px; border-radius:999px; background:var(--chip); margin-top:6px; overflow:hidden; }
   .meter i { display:block; height:100%; background:var(--ok); }
   .meter i.warn { background:var(--warn); } .meter i.over { background:var(--bad); }
@@ -630,6 +658,10 @@ DASHBOARD_PAGE = r"""<!doctype html>
 </header>
 <main>
   <div class="kpis" id="kpis"></div>
+  <section id="briefing-card">
+    <h2>Briefing <span class="meta" id="briefing-meta"></span><button id="briefing-go" type="button" class="small">Generate</button></h2>
+    <div id="briefing" class="briefing"></div>
+  </section>
   <div class="cols">
     <div class="stack">
     <section>
@@ -638,9 +670,19 @@ DASHBOARD_PAGE = r"""<!doctype html>
       <ul id="errors" class="list errors"></ul>
     </section>
     <section><h2>Open pull requests <span class="meta" id="prcount"></span></h2><ul id="pulls" class="list"></ul></section>
-    <section><h2>Autonomous runs <span class="meta">latest 10</span></h2><ul id="runs" class="list"></ul></section>
+    <section><h2>Autonomous runs <span class="meta">latest 10</span></h2>
+      <form id="runform" class="runform">
+        <textarea id="goal" rows="2" maxlength="4000" placeholder="Goal for a new autonomous run, e.g. Fix the failing Android build in owner/repo"></textarea>
+        <button id="rungo" class="primary" type="submit">Start run</button>
+      </form>
+      <p id="runhint" class="empty" hidden></p>
+      <ul id="runs" class="list"></ul></section>
     </div>
     <div class="stack">
+      <section id="spend-card"><h2>Spending <span class="meta" id="spend-meta"></span></h2>
+        <div class="chart" id="spend"></div>
+        <details><summary>Show as table</summary><table class="spendtable" id="spendtable"></table></details>
+      </section>
       <section><h2>Activity</h2><ul id="activity" class="list"></ul></section>
       <section><h2>Alerts</h2><ul id="alerts" class="list"></ul></section>
       <section><h2>Session</h2><dl id="session"></dl></section>
@@ -744,6 +786,9 @@ function render(d) {
     pulls.append(li);
   }
 
+  renderJobs(d.jobs, d.now);
+  renderSpend(d.spend);
+
   const runs = $("runs"); runs.textContent = "";
   if (!d.runs.length) runs.append(el("li", "empty", "No autonomous runs yet. Runs started with --auto or --watch --fix appear here."));
   for (const r of d.runs) {
@@ -751,7 +796,9 @@ function render(d) {
     // A run that stopped writing for 30 minutes most likely died with its process (Ctrl+C, crash, reboot).
     const stalled = r.status === "running" && d.now - (r.updated || r.started || d.now) > 1800;
     const status = stalled ? "stalled" : r.status;
-    head.append(el("span", "goal", r.goal || "(no goal)"), el("span", "status " + (stalled ? "failed" : r.status), status));
+    const goal = el("span", "goal", r.kind === "briefing" ? "Briefing" : (r.goal || "(no goal)"));
+    if (r.kind === "briefing") goal.append(el("span", "tag brief", "read-only"));
+    head.append(goal, el("span", "status " + (stalled ? "failed" : r.status), status));
     const meta = [ago(r.started, d.now), plural(r.steps || 0, "step")];
     if (r.errors) meta.push(plural(r.errors, "tool error"));
     if (r.cost_usd != null) meta.push(money(r.cost_usd));
@@ -836,6 +883,94 @@ async function fetchLog(name, pre, follow) {
   }
 }
 
+/*MARKDOWN*/
+// Briefing card, run form and job state. Jobs run in the background on the server; the page only starts them.
+function renderJobs(j, now) {
+  const card = $("briefing-card"), form = $("runform"), hint = $("runhint");
+  if (!j) { card.hidden = true; form.hidden = true; hint.hidden = true; return; }
+  const busy = !!j.current, b = j.briefing;
+  card.hidden = false;
+  const go = $("briefing-go");
+  go.disabled = busy; go.textContent = busy && j.current.kind === "briefing" ? "Working…" : (b ? "Refresh" : "Generate");
+  const meta = [];
+  if (b) { meta.push("made " + ago(b.generated_at, now)); if (b.cost_usd != null) meta.push(money(b.cost_usd)); }
+  if (j.daily_at) meta.push("daily at " + j.daily_at);
+  $("briefing-meta").textContent = meta.join(" · ");
+  const box = $("briefing");
+  if (busy && j.current.kind === "briefing") box.textContent = "Jarvis is reading your repositories… (started " + ago(j.current.started, now) + ")";
+  else if (b) renderMarkdown(box, b.text);
+  else box.textContent = "No briefing yet. Generate one to see what needs your attention across your repositories: failing CI, pull requests waiting for review and new issues. It uses tokens and changes nothing" + (j.daily_at ? "; one is also made each day at " + j.daily_at + "." : ".");
+  if (j.last_error) { const e = el("p", "error", j.last_error); box.append(document.createElement("br"), e); }
+
+  form.hidden = !j.allow_runs; hint.hidden = j.allow_runs;
+  if (!j.allow_runs) hint.textContent = "To start runs from here, start Jarvis with --web --auto. Runs started with --auto or --watch --fix still appear below.";
+  $("rungo").disabled = busy;
+  $("rungo").textContent = busy && j.current.kind === "run" ? "Running…" : "Start run";
+}
+async function startJob(path, body) {
+  const res = await fetch(path, {method: "POST", headers: {...headers, "Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+  if (!res.ok) { let msg = res.statusText; try { msg = (await res.json()).error || msg; } catch (e) {} alert(msg); return false; }
+  setTimeout(load, 400); return true;
+}
+$("briefing-go").onclick = () => startJob("/api/jobs/briefing");
+$("runform").onsubmit = async e => {
+  e.preventDefault(); const goal = $("goal").value.trim(); if (!goal) return;
+  if (await startJob("/api/jobs/run", {goal})) $("goal").value = "";
+};
+
+// Spending per day: one series, so no legend; hover any bar (or read the table) for the exact figures.
+let spendKey = "";
+function renderSpend(spend) {
+  const card = $("spend-card"); if (!spend) { card.hidden = true; return; }
+  card.hidden = false;
+  const key = JSON.stringify(spend.days);
+  if (key === spendKey) return;   // unchanged: keep the chart (and any open tooltip) as it is
+  spendKey = key;
+  const days = spend.days, total = days.reduce((a, d) => a + d.usd, 0), today = days[days.length - 1];
+  $("spend-meta").textContent = "last " + days.length + " days · " + money(total) + " · today " + money(today.usd);
+  const W = 320, H = 120, top = 14, bottom = 18, gap = 2, n = days.length, bw = W / n;
+  const max = Math.max(...days.map(d => d.usd)), scale = max > 0 ? (H - top - bottom) / max : 0;
+  const ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H); svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Estimated spending per day for the last " + n + " days; total " + money(total));
+  const mk = (tag, attrs) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+  const base = H - bottom;
+  svg.append(mk("line", {x1: 0, x2: W, y1: base, y2: base, class: "axis"}));
+  if (max > 0) { const t = mk("text", {x: 0, y: top - 4, class: "lbl"}); t.textContent = "peak " + money(max); svg.append(t); }
+  const tip = el("div", "tip"), box = $("spend"); tip.hidden = true;
+  days.forEach((d, i) => {
+    const x = i * bw + gap / 2, w = bw - gap, h = d.usd * scale, r = Math.min(4, w / 2, h);
+    const hit = mk("rect", {x: i * bw, y: 0, width: bw, height: H, class: "hit"});   // the whole column is the target
+    const bar = h > 0 ? mk("path", {class: "bar", d: "M" + x + "," + base + "V" + (base - h + r) + "Q" + x + "," + (base - h) + " " + (x + r) + "," + (base - h) +
+      "H" + (x + w - r) + "Q" + (x + w) + "," + (base - h) + " " + (x + w) + "," + (base - h + r) + "V" + base + "Z"}) : mk("g", {});
+    const label = new Date(d.date + "T12:00:00").toLocaleDateString(undefined, {weekday: "short", day: "numeric", month: "short"});
+    const parts = Object.entries(d.by_kind).filter(([, v]) => v > 0).map(([k, v]) => k + " " + money(v));
+    hit.addEventListener("pointerenter", () => {
+      tip.textContent = label + ": " + money(d.usd) + (parts.length > 1 ? " (" + parts.join(", ") + ")" : parts.length ? " (" + parts[0].split(" ")[0] + ")" : "");
+      tip.hidden = false; tip.style.top = Math.max(0, (base - h - 6) / H * 100) + "%";
+      const room = box.clientWidth, half = tip.offsetWidth / 2, centre = (x + w / 2) / W * room;
+      tip.style.left = Math.min(Math.max(centre, half), room - half) + "px";   // stay inside the card
+      if (bar.classList) bar.classList.add("on");
+    });
+    hit.addEventListener("pointerleave", () => { tip.hidden = true; if (bar.classList) bar.classList.remove("on"); });
+    svg.append(hit, bar);
+    if (i === 0 || i === n - 1 || i === Math.floor((n - 1) / 2)) {   // a few dates, not every one
+      const t = mk("text", {x: i * bw + bw / 2, y: H - 4, "text-anchor": i === 0 ? "start" : i === n - 1 ? "end" : "middle", class: "lbl"});
+      if (i === 0) t.setAttribute("x", 0); if (i === n - 1) t.setAttribute("x", W);
+      t.textContent = i === n - 1 ? "today" : new Date(d.date + "T12:00:00").toLocaleDateString(undefined, {day: "numeric", month: "short"});
+      svg.append(t);
+    }
+  });
+  box.textContent = ""; box.append(svg, tip);
+  const table = $("spendtable"); table.textContent = "";
+  const head = document.createElement("tr"); for (const h of ["Day", "Chat", "Runs", "Briefings", "Total"]) head.append(el("th", "", h)); table.append(head);
+  for (const d of [...days].reverse()) {
+    const tr = document.createElement("tr");
+    for (const v of [d.date, money(d.by_kind.chat || 0), money(d.by_kind.run || 0), money(d.by_kind.briefing || 0), money(d.usd)]) tr.append(el("td", "", v));
+    table.append(tr);
+  }
+}
+
 let timer = null;
 async function load() {
   clearTimeout(timer);
@@ -860,3 +995,8 @@ load();
 </body>
 </html>
 """
+
+
+# The light Markdown renderer lives once, in the chat page; the dashboard uses the same code for the briefing.
+MARKDOWN_JS = PAGE[PAGE.index("// Light Markdown"):PAGE.index("// Speak sentence")]
+DASHBOARD_PAGE = DASHBOARD_PAGE.replace("/*MARKDOWN*/", MARKDOWN_JS)
