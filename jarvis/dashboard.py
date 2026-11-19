@@ -22,6 +22,7 @@ MAX_ALERTS = 50
 MAX_MEMORY_NOTES = 5
 MAX_PULLS_PER_REPO = 20
 MAX_RUNS = 10
+SPEND_DAYS = 14
 MAX_LOG_BYTES = 200_000  # the end of a long run log is the useful part
 LOG_NAME = re.compile(r"[\w-]+\.md")
 
@@ -29,13 +30,15 @@ LOG_NAME = re.compile(r"[\w-]+\.md")
 class Dashboard:
     def __init__(self, jarvis: Jarvis, watcher: watch.Watcher | None = None, interval_s: float = 300,
                  clock: Callable[[], float] = time.time, auto_approve: bool = False,
-                 runs_dir: Path | None = None) -> None:
+                 runs_dir: Path | None = None, jobs: Any = None, ledger: Any = None) -> None:
         self.jarvis = jarvis
         self.watcher = watcher
         self.interval_s = interval_s
         self.clock = clock
         self.auto_approve = auto_approve
         self.runs_dir = runs_dir
+        self.jobs = jobs  # a JobRunner: runs and briefings started from the dashboard
+        self.ledger = ledger  # a SpendLedger: cost per day across every session
         self.started_at = clock()
         self.lock = threading.Lock()
         self.alerts: deque[dict[str, Any]] = deque(maxlen=MAX_ALERTS)
@@ -175,6 +178,7 @@ class Dashboard:
                 "steps": data.get("steps"), "errors": data.get("errors"),
                 "pull_requests": [u for u in prs if isinstance(u, str)][:5] if isinstance(prs, list) else [],
                 "cost_usd": data.get("cost_usd"), "model": data.get("model"), "log": path.with_suffix(".md").name,
+                "kind": "briefing" if data.get("kind") == "briefing" else "run",
             })
         return runs
 
@@ -208,6 +212,8 @@ class Dashboard:
                 "now": self.clock(),
                 "ci": ci,
                 "runs": self.recent_runs(),
+                "jobs": self.jobs.status() if self.jobs is not None else None,
+                "spend": {"days": self.ledger.daily(SPEND_DAYS, now=self.clock())} if self.ledger is not None else None,
                 "session": {
                     "model": jarvis.model,
                     "effort": jarvis.effort,

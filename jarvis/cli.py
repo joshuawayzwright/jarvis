@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
 import sys
 import time
 from collections.abc import Callable
@@ -14,10 +12,12 @@ from pathlib import Path
 
 import anthropic
 
-from . import autopilot, github, mcp_bridge, notify, pricing, sandbox, selftest, team, voice, wake, watch, web
-from .agent import AUTO_MAX_STEPS, DEFAULT_MAX_STEPS, DEFAULT_MODEL, Jarvis, TokenBudget, parse_tokens
+from . import autopilot, github, jobs, mcp_bridge, notify, pricing, sandbox, selftest, team, voice, wake, watch, web
+from .agent import AUTO_MAX_STEPS, DEFAULT_MAX_STEPS, DEFAULT_MODEL, Jarvis, Spend, TokenBudget, parse_tokens
 from .dashboard import Dashboard
 from .memory import Memory
+from .runlog import RunLog
+from .spend import SpendLedger
 from .tools import ToolContext
 
 DIM, CYAN, RED, RESET = "\033[2m", "\033[36m", "\033[31m", "\033[0m"
@@ -35,109 +35,6 @@ def make_approver(auto_yes: bool):
         return answer in ("y", "yes")
 
     return approve
-
-
-PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
-
-
-class RunLog:
-    """Markdown record of an autonomous run: the goal, every tool call and result, and the outcome.
-
-    Next to each `<stamp>.md` is a `<stamp>.json` summary (goal, status, steps, pull requests, tokens and
-    estimated cost) that the web dashboard lists. A second goal in the same session starts a new pair of files.
-    """
-
-    def __init__(self, directory: Path, jarvis: Jarvis | None = None) -> None:
-        directory.mkdir(parents=True, exist_ok=True)
-        self.directory = directory
-        self.jarvis = jarvis  # set after the agent exists; supplies the model and token usage
-        self.summary: dict[str, object] = {}
-        self._usage_start: dict[str, int] = {}
-        self._open()
-
-    def _open(self) -> None:
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        path, n = self.directory / f"{stamp}.md", 1
-        while path.exists():
-            n += 1
-            path = self.directory / f"{stamp}-{n}.md"
-        self.path = path
-        self.summary_path = path.with_suffix(".json")
-        self.summary = {"goal": None, "status": "running", "started": time.time(), "updated": time.time(),
-                        "steps": 0, "errors": 0, "pull_requests": [], "log": path.name}
-        self._write(f"# Jarvis run {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-    def _write(self, text: str) -> None:
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(text + "\n")
-
-    def _save(self) -> None:
-        self.summary["updated"] = time.time()
-        if self.summary.get("goal") is None:
-            return  # an interactive session that never set a goal isn't listed as a run
-        tmp = self.summary_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.summary, indent=2), encoding="utf-8")
-        tmp.replace(self.summary_path)
-
-    def _note_pull_requests(self, text: str) -> None:
-        found = self.summary["pull_requests"]
-        assert isinstance(found, list)
-        for url in PR_URL.findall(text):
-            if url not in found:
-                found.append(url)
-
-    def goal(self, text: str) -> None:
-        if self.summary.get("goal") is not None:
-            self._open()  # e.g. watch --fix: one run per fix
-        self.summary["goal"] = text
-        if self.jarvis is not None:
-            self.summary["model"] = self.jarvis.model
-            self._usage_start = dict(self.jarvis.usage)
-        self._write(f"## Goal\n\n{text}\n\n## Steps\n")
-        self._save()
-
-    def text(self, text: str) -> None:
-        self._write(f"\n**Jarvis:** {text}\n")
-        self._note_pull_requests(text)
-        self._save()
-
-    def tool(self, line: str) -> None:
-        self._write(f"- `{line}`")
-        self.summary["steps"] = int(self.summary["steps"]) + 1  # type: ignore[call-overload]
-        self._save()
-
-    def finish(self, ok: bool, reply: str | None = None) -> None:
-        """Record how the run ended, with the tokens it used and their estimated cost."""
-        self.summary["status"] = "done" if ok else "failed"
-        if self.jarvis is not None and self.jarvis.over_budget():
-            self.summary["status"] = "over budget"
-        if reply:
-            self.summary["reply"] = reply[:500]
-            self._note_pull_requests(reply)
-        if self.jarvis is not None:
-            usage = {k: v - self._usage_start.get(k, 0) for k, v in self.jarvis.usage.items()}
-            self.summary["usage"] = usage
-            self.summary["cost_usd"] = pricing.estimate_cost(self.jarvis.model, usage)
-        self._write(f"\n## Outcome\n\n{'Finished' if ok else 'Stopped with an error'}.\n")
-        self._save()
-
-    def crew(self, status: str) -> None:
-        self.section("Crew", status)
-
-    def section(self, title: str, body: str) -> None:
-        self._write(f"\n## {title}\n\n```\n{body}\n```")
-
-    def result(self, name: str, content: object, is_error: bool) -> None:
-        if is_error:
-            self.summary["errors"] = int(self.summary["errors"]) + 1  # type: ignore[call-overload]
-        if not isinstance(content, str):
-            content = "[image and text content]"
-        else:
-            self._note_pull_requests(content)
-        self._save()
-        head = content.strip().splitlines()[:6]
-        marker = "ERROR " if is_error else ""
-        self._write("  ```\n  " + marker + "\n  ".join(line[:200] for line in head) + "\n  ```")
 
 
 def run_turn(jarvis: Jarvis, prompt: str) -> str | None:
@@ -394,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     group_web.add_argument("--web-port", type=int, default=8765)
     group_web.add_argument("--web-cert", type=Path, help="TLS certificate (PEM) to serve HTTPS. Phones only allow the microphone over HTTPS.")
     group_web.add_argument("--web-key", type=Path, help="TLS private key (PEM) for --web-cert.")
+    group_web.add_argument("--brief-daily", metavar="HH:MM", default=os.environ.get("JARVIS_BRIEF_DAILY", ""), help="With --web: make a fresh briefing for the dashboard each day at this local time (it uses tokens; a Generate button makes one any time). Also JARVIS_BRIEF_DAILY.")
     parser.add_argument("--budget", type=float, default=None, metavar="USD", help="Spending limit for this session in US dollars, from the estimated cost of its tokens at list price. In team mode it covers Jarvis and every specialist together. Jarvis warns at 80%% and stops before going over. Works with models that have a known price.")
     parser.add_argument("--max-steps", type=int, default=None, help=f"Max agent steps per request (default {DEFAULT_MAX_STEPS}, or {AUTO_MAX_STEPS} with --auto).")
     group = parser.add_argument_group("voice")
@@ -405,6 +303,16 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--whisper-model", default=os.environ.get("JARVIS_WHISPER_MODEL", "base.en"), help="Whisper model: tiny.en, base.en, small.en, medium.en, or a multilingual size such as small.")
     group.add_argument("--language", default=None, help="Spoken language code (e.g. en). Default: auto-detect.")
     args = parser.parse_args(argv)
+    args.home = home
+    if args.brief_daily:
+        if not args.web:
+            parser.error("--brief-daily works with --web")
+        try:
+            args.brief_daily = jobs.parse_daily(args.brief_daily)
+        except ValueError as err:
+            parser.error(f"--brief-daily: {err}")
+    else:
+        args.brief_daily = None
     if args.budget is not None and args.budget <= 0:
         parser.error("--budget must be more than 0")
     try:
@@ -546,6 +454,40 @@ def make_watcher(targets: list[str]) -> watch.Watcher:
     return watch.Watcher(repos, owners)
 
 
+def make_job_agent(args: argparse.Namespace, mcp: mcp_bridge.MCPManager | None,
+                   ledger: SpendLedger | None) -> jobs.MakeAgent:
+    """Agents for dashboard jobs. A run is autonomous (it may only be started with --auto); a briefing
+    declines every write, command, commit and push. Neither takes screenshots."""
+
+    def make(kind: str, log: RunLog) -> Jarvis:
+        autonomous = kind == "run"
+        return Jarvis(
+            ctx=ToolContext(
+                workspace=args.workspace.resolve(),
+                approve=(lambda _q: True) if autonomous else (lambda _q: False),
+                memory=None if args.no_memory else Memory(args.workspace.parent / "memory.md"),
+                confirm_private=lambda _q: False,
+                sandbox=getattr(args, "sandbox_box", None),
+            ),
+            mcp=mcp,
+            model=args.model,
+            effort=args.effort,
+            autonomous=autonomous,
+            team_mode=args.team and autonomous,
+            team_models=args.team_models if autonomous else {},
+            sentinel_mcp=frozenset(n.strip() for n in getattr(args, "sentinel_mcp", "").split(",") if n.strip()),
+            token_budget=TokenBudget(args.token_budget) if args.token_budget else None,
+            max_steps=args.max_steps or (AUTO_MAX_STEPS if autonomous else DEFAULT_MAX_STEPS),
+            on_text=log.text,
+            on_tool=log.tool,
+            on_result=log.result,
+            budget_usd=args.budget,
+            spend=Spend(ledger, kind=kind),
+        )
+
+    return make
+
+
 def run_web(args: argparse.Namespace, jarvis: Jarvis) -> int:
     import ssl
 
@@ -560,8 +502,15 @@ def run_web(args: argparse.Namespace, jarvis: Jarvis) -> int:
             watcher = make_watcher(args.watch)
         except github.GitHubError as err:
             print(f"Dashboard CI watch is off: it needs targets or a GitHub token. ({err})", file=sys.stderr)
+    runs_dir = args.workspace.parent / "runs"
+    ledger = jarvis.spend.ledger if jarvis.spend is not None else None
+    owners = [t for t in (args.watch or []) if "/" not in t]
+    runner = jobs.JobRunner(
+        make_job_agent(args, jarvis.mcp, ledger), runs_dir, args.home / "briefing.json",
+        briefing_prompt=lambda: briefing_prompt(owners[0] if owners else github.authenticated_login()),
+        allow_runs=args.auto, daily_at=args.brief_daily)
     dashboard = Dashboard(jarvis, watcher, interval_s=args.interval * 60, auto_approve=auto_approve,
-                          runs_dir=args.workspace.parent / "runs")
+                          runs_dir=runs_dir, jobs=runner, ledger=ledger)
     try:
         server, token = web.serve(session, args.web_host, args.web_port, dashboard=dashboard)
     except OSError as err:
@@ -582,12 +531,16 @@ def run_web(args: argparse.Namespace, jarvis: Jarvis) -> int:
     if args.web_host not in ("127.0.0.1", "localhost", "::1"):
         print(f"{DIM}Reachable from other devices on your network."
               f"{'' if scheme == 'https' else ' Without --web-cert the connection is unencrypted and phones block the microphone.'}{RESET}")
+    if args.brief_daily:
+        print(f"{DIM}A new briefing is made each day at {args.brief_daily[0]:02d}:{args.brief_daily[1]:02d} (local time).{RESET}")
     dashboard.start()
+    runner.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print()
     finally:
+        runner.stop()
         dashboard.stop()
         server.server_close()
     return 0
@@ -735,6 +688,7 @@ def run(args: argparse.Namespace, io: VoiceIO | None, listener: wake.WakeWordLis
             on_tool=show_tool,
             on_result=log.result if log else (lambda name, content, is_error: None),
             budget_usd=args.budget,
+            spend=Spend(SpendLedger(args.home / "spend.jsonl"), kind="run" if args.auto else "chat"),
         )
     except ValueError as err:  # a spending limit on a model without a known price
         print(str(err), file=sys.stderr)
