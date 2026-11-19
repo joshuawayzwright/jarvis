@@ -137,6 +137,25 @@ def test_log_download_never_forwards_the_token(monkeypatch: pytest.MonkeyPatch) 
     assert seen["/blob/log.txt?sig=1"] is None  # the storage host never sees the token
 
 
+def test_log_download_refuses_non_web_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", "file:///etc/passwd")
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:
+            return None
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setattr(github, "API_ROOT", f"http://127.0.0.1:{server.server_port}")
+        with pytest.raises(github.GitHubError, match="non-web redirect"):
+            github.api_get_text("/repos/a/b/actions/jobs/1/logs")
+    finally:
+        server.shutdown()
+
 def test_briefing_prompt_names_owner_and_tools() -> None:
     prompt = cli.briefing_prompt("octocat")
     for needle in ("octocat", "list_user_repos", "github_activity", "get_ci_failure"):
