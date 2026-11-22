@@ -59,12 +59,11 @@ Jarvis can run in **GitHub Codespaces**, a Linux machine in the cloud that you o
 1. **Save your key as a Codespaces secret** (one time). On GitHub, open **Settings > Codespaces > Secrets > New secret**:
    - Name: `ANTHROPIC_API_KEY`. Value: your key from platform.claude.com. Repository access: `joshuawayzwright/jarvis`.
    - Optional: `JARVIS_GITHUB_TOKEN`, a [fine-grained token](https://github.com/settings/personal-access-tokens/new) with **Contents** and **Pull requests** set to read and write, for the repositories you want Jarvis to work on. Without it, Jarvis can only reach this repository.
-2. **Start a codespace.** Open **https://codespaces.new/joshuawayzwright/jarvis** and tap **Create codespace**. Jarvis installs itself automatically (about two minutes the first time).
-3. **Start Jarvis.** In the terminal at the bottom, type:
-   ```bash
-   jarvis --web
-   ```
-4. **Tap the link it prints**, which looks like `https://<name>-8765.app.github.dev/?token=...`. It's HTTPS, so the 🎙 microphone works. Tick **Speak replies** to hear the answers.
+2. **Start a codespace.** Open **https://codespaces.new/joshuawayzwright/jarvis** and tap **Create codespace**. Jarvis installs itself (about two minutes the first time) and then **starts by itself**, with the dashboard, CI watch for your repositories, autonomous runs and a $5 spending limit per session (`jarvis --web --watch --auto --budget 5`).
+3. **Tap the dashboard link** it prints in the terminal, which looks like `https://<name>-8765.app.github.dev/dashboard?token=...`. It's HTTPS, so notifications and the 🎙 microphone work. Add it to your home screen if you like. Reopening the codespace prints the same links again.
+4. **Change how it starts** with Codespaces secrets at github.com/settings/codespaces (repository access `joshuawayzwright/jarvis`), then restart the codespace:
+   - `JARVIS_AUTOSTART_ARGS`: the options to start with, e.g. `--web --watch --budget 10` (without `--auto`, Jarvis asks before every change and the dashboard can't start runs).
+   - `JARVIS_AUTOSTART=0`: don't start automatically; type `jarvis --web` yourself.
 5. **When you're done**, stop the codespace (github.com/codespaces > ⋯ > **Stop codespace**). Personal accounts get a free monthly allowance of Codespaces hours, and a stopped codespace doesn't use any.
 
 The forwarded address is private: only your signed-in GitHub account can open it, and Jarvis's own token protects it as well.

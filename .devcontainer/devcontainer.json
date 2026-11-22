@@ -2,6 +2,7 @@
   "name": "Jarvis",
   "image": "mcr.microsoft.com/devcontainers/python:3.12",
   "postCreateCommand": "python -m pip install --upgrade pip && python -m pip install -e '.[mcp]'",
+  "postAttachCommand": "bash .devcontainer/start-jarvis.sh",
   "forwardPorts": [8765],
   "portsAttributes": {
     "8765": { "label": "Jarvis web", "onAutoForward": "notify" }
