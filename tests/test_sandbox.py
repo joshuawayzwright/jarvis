@@ -66,13 +66,20 @@ def test_bad_settings_are_refused(tmp_path: Path, kwargs: dict, error: str) -> N
         sandbox.Sandbox(home_root=tmp_path, **kwargs)
 
 
-def test_timeout_kills_the_container(tmp_path: Path) -> None:
-    runner = FakeRunner([subprocess.TimeoutExpired("docker", 10), done()])
+def test_timeout_kills_the_container_and_waits_until_it_has_stopped(tmp_path: Path) -> None:
+    runner = FakeRunner([subprocess.TimeoutExpired("docker", 10), done(), done(0, "137")])
     box = sandbox.Sandbox(home_root=tmp_path, runner=runner)
     with pytest.raises(subprocess.TimeoutExpired):
         box.run(tmp_path, "acme/app", "sleep 99", timeout=10)
     name = runner.calls[0][runner.calls[0].index("--name") + 1]
-    assert runner.calls[1] == ["docker", "kill", name]
+    # kill only sends the signal; wait returns once the container has really stopped
+    assert runner.calls[1:] == [["docker", "kill", name], ["docker", "wait", name]]
+
+    # Already removed by --rm (wait fails) or a hung daemon (kill times out): still reported as the timeout.
+    for results in ([done(), done(1, err="No such container")], [subprocess.TimeoutExpired("docker", 30)]):
+        runner = FakeRunner([subprocess.TimeoutExpired("docker", 10), *results])
+        with pytest.raises(subprocess.TimeoutExpired):
+            sandbox.Sandbox(home_root=tmp_path, runner=runner).run(tmp_path, "acme/app", "sleep 99", timeout=10)
 
 
 def test_check_reports_missing_docker_and_pulls_missing_images(tmp_path: Path) -> None:
