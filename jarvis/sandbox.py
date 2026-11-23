@@ -82,7 +82,14 @@ class Sandbox:
             return self.runner(self.command_line(root, repo, command, name), capture_output=True, text=True,
                                timeout=timeout)
         except subprocess.TimeoutExpired:
-            self.runner([self.docker, "kill", name], capture_output=True, text=True, timeout=30)
+            # `docker kill` returns once the signal is sent, not once the container has stopped, so wait for
+            # it: when run() returns, nothing from the command is still running. Errors are expected here
+            # (the container may already be gone, removed by --rm) and don't matter.
+            for step in ("kill", "wait"):
+                try:
+                    self.runner([self.docker, step, name], capture_output=True, text=True, timeout=30)
+                except subprocess.TimeoutExpired:
+                    break
             raise
 
     def check(self, pull: bool = True) -> str:
