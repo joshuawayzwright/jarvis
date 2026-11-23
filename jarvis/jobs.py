@@ -28,6 +28,7 @@ MAX_GOAL_CHARS = 4_000
 MAX_BRIEFING_CHARS = 20_000
 
 MakeAgent = Callable[[str, RunLog], Any]  # (kind, log) -> a Jarvis wired to that log
+OnFinish = Callable[[dict[str, Any]], None]  # told about every finished job (e.g. to send a --notify message)
 
 
 def parse_daily(text: str) -> tuple[int, int]:
@@ -42,7 +43,8 @@ def parse_daily(text: str) -> tuple[int, int]:
 class JobRunner:
     def __init__(self, make_agent: MakeAgent, runs_dir: Path, state_path: Path,
                  briefing_prompt: Callable[[], str], allow_runs: bool = False,
-                 daily_at: tuple[int, int] | None = None, clock: Callable[[], float] = time.time) -> None:
+                 daily_at: tuple[int, int] | None = None, clock: Callable[[], float] = time.time,
+                 on_finish: OnFinish | None = None) -> None:
         self.make_agent = make_agent
         self.runs_dir = runs_dir
         self.state_path = state_path
@@ -50,7 +52,10 @@ class JobRunner:
         self.allow_runs = allow_runs
         self.daily_at = daily_at
         self.clock = clock
+        self.on_finish = on_finish
         self._lock = threading.Lock()
+        self._cancel = threading.Event()  # set by Stop; the running job's agent checks it before each request
+        self.last_finished: dict[str, Any] | None = None  # the most recent job's outcome, for the dashboard
         self.current: dict[str, Any] | None = None
         self.last_error: str | None = None
         self.briefing: dict[str, Any] | None = self._load_briefing()
@@ -98,28 +103,45 @@ class JobRunner:
         with self._lock:
             if self.current is not None:
                 return f"A {self.current['kind']} is already running; it has to finish first."
-            self.current = {"kind": kind, "goal": goal, "started": self.clock(), "trigger": trigger, "log": None}
+            self.current = {"kind": kind, "goal": goal, "started": self.clock(), "trigger": trigger, "log": None,
+                            "stopping": False}
             self.last_error = None
+            self._cancel = threading.Event()
         thread = threading.Thread(target=self._work, args=(kind, goal), name=f"jarvis-{kind}", daemon=True)
         thread.start()
         self._threads.append(thread)
         return None
 
+    def cancel(self) -> str | None:
+        """Ask the running job to stop. It stops before its next step (a command already running finishes first).
+        Returns an error message, or None when the request was passed on."""
+        with self._lock:
+            if self.current is None:
+                return "Nothing is running."
+            self.current["stopping"] = True
+        self._cancel.set()
+        return None
+
     def _work(self, kind: str, goal: str) -> None:
         reply: str | None = None
         log: RunLog | None = None
+        cancel = self._cancel
         try:
             log = RunLog(self.runs_dir, kind=kind)
             agent = self.make_agent(kind, log)
+            agent.should_stop = cancel.is_set
             log.jarvis = agent
             log.goal(goal)
             with self._lock:
                 if self.current is not None:
                     self.current["log"] = log.path.name
             reply = agent.ask(goal)
-            ok = bool(reply) and not agent.over_budget()
-            log.finish(ok, reply)
-            if kind == "briefing" and ok:
+            cancelled = cancel.is_set() or getattr(agent, "stop_reason", "") == "cancelled"
+            ok = bool(reply) and not cancelled and not agent.over_budget()
+            log.finish(ok, reply, status="cancelled" if cancelled else None)
+            if cancelled:
+                pass  # stopped on request: not an error
+            elif kind == "briefing" and ok:
                 briefing = {"text": (reply or "")[:MAX_BRIEFING_CHARS], "generated_at": self.clock(),
                             "cost_usd": log.summary.get("cost_usd"), "log": log.path.name}
                 self._save_briefing(briefing)
@@ -131,8 +153,19 @@ class JobRunner:
             if log is not None:
                 log.finish(False, None)
         finally:
+            summary = log.summary if log is not None else {}
+            finished = {"kind": kind, "goal": goal, "status": summary.get("status", "failed"),
+                        "finished": self.clock(), "log": log.path.name if log is not None else None,
+                        "cost_usd": summary.get("cost_usd"), "pull_requests": list(summary.get("pull_requests") or []),
+                        "reply": (reply or "")[:300]}
             with self._lock:
                 self.current = None
+                self.last_finished = finished
+            if self.on_finish is not None:
+                try:
+                    self.on_finish(finished)
+                except Exception:  # noqa: BLE001 - a failed notification must not break the runner
+                    pass
 
     # Daily briefing
 
@@ -176,6 +209,7 @@ class JobRunner:
             "allow_runs": self.allow_runs,
             "current": current,
             "last_error": self.last_error,
+            "last_finished": dict(self.last_finished) if self.last_finished else None,
             "briefing": dict(self.briefing) if self.briefing else None,
             "daily_at": f"{self.daily_at[0]:02d}:{self.daily_at[1]:02d}" if self.daily_at else None,
         }

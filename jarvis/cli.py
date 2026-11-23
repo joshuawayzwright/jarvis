@@ -488,6 +488,31 @@ def make_job_agent(args: argparse.Namespace, mcp: mcp_bridge.MCPManager | None,
     return make
 
 
+def job_message(job: dict) -> tuple[str, str]:
+    """Title and text for a finished dashboard job, for --notify."""
+    kind, status = job.get("kind", "run"), job.get("status", "failed")
+    if kind == "briefing":
+        title = "Jarvis: your briefing is ready" if status == "done" else f"Jarvis: the briefing {status}"
+        body = str(job.get("reply") or "Open the dashboard to read it.")
+    else:
+        title = {"done": "Jarvis finished a run", "cancelled": "Jarvis run stopped"}.get(status, f"Jarvis run {status}")
+        goal = " ".join(str(job.get("goal", "")).split())
+        body = f"Goal: {goal[:200]}{'…' if len(goal) > 200 else ''}"
+        prs = job.get("pull_requests") or []
+        if prs:
+            body += "\nPull requests: " + ", ".join(prs)
+    cost = job.get("cost_usd")
+    if isinstance(cost, (int, float)):
+        body += f"\nEstimated cost: ${cost:.2f}"
+    return title, body
+
+
+def job_notifier(notifier: notify.Notifier | None) -> Callable[[dict], None] | None:
+    if notifier is None:
+        return None
+    return lambda job: notifier.send(*job_message(job))
+
+
 def run_web(args: argparse.Namespace, jarvis: Jarvis) -> int:
     import ssl
 
@@ -508,7 +533,7 @@ def run_web(args: argparse.Namespace, jarvis: Jarvis) -> int:
     runner = jobs.JobRunner(
         make_job_agent(args, jarvis.mcp, ledger), runs_dir, args.home / "briefing.json",
         briefing_prompt=lambda: briefing_prompt(owners[0] if owners else github.authenticated_login()),
-        allow_runs=args.auto, daily_at=args.brief_daily)
+        allow_runs=args.auto, daily_at=args.brief_daily, on_finish=job_notifier(make_notifier(args)))
     dashboard = Dashboard(jarvis, watcher, interval_s=args.interval * 60, auto_approve=auto_approve,
                           runs_dir=runs_dir, jobs=runner, ledger=ledger)
     try:

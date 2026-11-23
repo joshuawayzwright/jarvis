@@ -219,12 +219,14 @@ def make_handler(session: WebSession, token: str, dashboard: Dashboard) -> type[
             if path == "/api/approve":
                 ok = session.answer(str(data.get("id", "")), bool(data.get("approved")))
                 self._json(200 if ok else 404, {"ok": ok})
-            elif path in ("/api/jobs/run", "/api/jobs/briefing"):
+            elif path in ("/api/jobs/run", "/api/jobs/briefing", "/api/jobs/stop"):
                 if dashboard.jobs is None:
                     self._json(404, {"error": "Jobs aren't available in this session."})
                     return
                 if path == "/api/jobs/run":
                     error = dashboard.jobs.start_run(str(data.get("goal", "")))
+                elif path == "/api/jobs/stop":
+                    error = dashboard.jobs.cancel()
                 else:
                     error = dashboard.jobs.start_briefing()
                 self._json(409 if error else 202, {"error": error} if error else {"ok": True})
@@ -626,6 +628,9 @@ DASHBOARD_PAGE = r"""<!doctype html>
                font-size:12px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; }
   button.small { font-size:13px; padding:3px 10px; margin-left:8px; }
   .briefing { white-space:pre-wrap; overflow-wrap:anywhere; font-size:14px; max-height:340px; overflow:auto; }
+  .jobnow { display:flex; gap:10px; align-items:center; flex-wrap:wrap; border:1px solid var(--warn); border-radius:10px;
+            padding:8px 10px; margin-bottom:10px; font-size:14px; }
+  .jobnow .what { flex:1; min-width:160px; overflow-wrap:anywhere; }
   .runform { display:flex; gap:8px; margin-bottom:12px; align-items:flex-start; }
   .runform textarea { flex:1; font:inherit; font-size:14px; padding:8px; border-radius:10px; border:1px solid var(--line);
                       background:var(--bg); color:var(--text); resize:vertical; min-height:42px; }
@@ -671,6 +676,7 @@ DASHBOARD_PAGE = r"""<!doctype html>
     </section>
     <section><h2>Open pull requests <span class="meta" id="prcount"></span></h2><ul id="pulls" class="list"></ul></section>
     <section><h2>Autonomous runs <span class="meta">latest 10</span></h2>
+      <div id="jobnow" class="jobnow" hidden></div>
       <form id="runform" class="runform">
         <textarea id="goal" rows="2" maxlength="4000" placeholder="Goal for a new autonomous run, e.g. Fix the failing Android build in owner/repo"></textarea>
         <button id="rungo" class="primary" type="submit">Start run</button>
@@ -713,9 +719,19 @@ function kpi(label, value, sub, cls) {
   const box = el("div", "kpi"); box.append(el("div", "label", label), el("div", "value " + (cls || ""), value));
   if (sub) box.append(el("div", "sub", sub)); return box;
 }
+const short = (text, n) => text.length > n ? text.slice(0, n).trimEnd() + "…" : text;   // long goals: the start, full text on hover
+let jobsState = null;   // the latest jobs status, for the Fix buttons
 function fixLink(prompt) {
   const b = el("button", "primary", "Fix with Jarvis");
-  b.onclick = () => { location.href = "/?token=" + encodeURIComponent(token) + "#ask=" + encodeURIComponent(prompt); };
+  b.onclick = async () => {
+    if (jobsState && jobsState.allow_runs) {   // started with --auto: one tap starts a background fix run
+      if (jobsState.current) { alert("A " + jobsState.current.kind + " is already running. Stop it or wait for it to finish."); return; }
+      if (!confirm("Start an autonomous fix run? Jarvis will investigate, change code and open a draft pull request for you to review. It counts toward the spending limit.")) return;
+      if (await startJob("/api/jobs/run", {goal: prompt})) b.textContent = "Fix started";
+      return;
+    }
+    location.href = "/?token=" + encodeURIComponent(token) + "#ask=" + encodeURIComponent(prompt);   // otherwise: the chat, to review and send
+  };
   return b;
 }
 
@@ -796,7 +812,8 @@ function render(d) {
     // A run that stopped writing for 30 minutes most likely died with its process (Ctrl+C, crash, reboot).
     const stalled = r.status === "running" && d.now - (r.updated || r.started || d.now) > 1800;
     const status = stalled ? "stalled" : r.status;
-    const goal = el("span", "goal", r.kind === "briefing" ? "Briefing" : (r.goal || "(no goal)"));
+    const goal = el("span", "goal", r.kind === "briefing" ? "Briefing" : short(r.goal || "(no goal)", 160));
+    if (r.kind !== "briefing") goal.title = r.goal || "";
     if (r.kind === "briefing") goal.append(el("span", "tag brief", "read-only"));
     head.append(goal, el("span", "status " + (stalled ? "failed" : r.status), status));
     const meta = [ago(r.started, d.now), plural(r.steps || 0, "step")];
@@ -858,6 +875,16 @@ if ("Notification" in window && window.isSecureContext) {
     setNotify((await Notification.requestPermission()) === "granted");
   };
 }
+let lastFinished = null;
+function notifyFinished(f) {   // a browser notification when a run or briefing finishes (the first load only sets the baseline)
+  const at = f ? f.finished : 0;
+  if (lastFinished !== null && at > lastFinished && notifyBtn.classList.contains("on") && Notification.permission === "granted") {
+    const title = f.kind === "briefing" ? (f.status === "done" ? "Your briefing is ready" : "Briefing " + f.status)
+      : ({done: "Run finished", cancelled: "Run stopped"}[f.status] || "Run " + f.status);
+    new Notification(title, {body: f.kind === "briefing" ? "Open the dashboard to read it." : f.goal.slice(0, 120), tag: "jarvis-job"});
+  }
+  lastFinished = Math.max(lastFinished || 0, at);
+}
 function notifyNew(alerts) {
   const newest = alerts.length ? alerts[0].time : 0;
   if (lastAlert !== null && notifyBtn.classList.contains("on") && Notification.permission === "granted") {
@@ -886,8 +913,21 @@ async function fetchLog(name, pre, follow) {
 /*MARKDOWN*/
 // Briefing card, run form and job state. Jobs run in the background on the server; the page only starts them.
 function renderJobs(j, now) {
-  const card = $("briefing-card"), form = $("runform"), hint = $("runhint");
-  if (!j) { card.hidden = true; form.hidden = true; hint.hidden = true; return; }
+  const card = $("briefing-card"), form = $("runform"), hint = $("runhint"), banner = $("jobnow");
+  jobsState = j;
+  if (!j) { card.hidden = true; form.hidden = true; hint.hidden = true; banner.hidden = true; return; }
+  banner.hidden = !j.current; banner.textContent = "";
+  if (j.current) {
+    const what = j.current.kind === "briefing" ? "Making the briefing" : "Running: " + j.current.goal;
+    const label = el("span", "what", short(what, 110) + " · started " + ago(j.current.started, now)); label.title = what;
+    banner.append(label);
+    const stop = el("button", "", j.current.stopping ? "Stopping…" : "Stop");
+    stop.disabled = !!j.current.stopping;
+    stop.title = "Stops before Jarvis's next step; a command already running finishes first.";
+    stop.onclick = async () => { if (confirm("Stop this " + j.current.kind + "? Changes it already made stay as they are.")) await startJob("/api/jobs/stop"); };
+    banner.append(stop);
+  }
+  notifyFinished(j.last_finished);
   const busy = !!j.current, b = j.briefing;
   card.hidden = false;
   const go = $("briefing-go");

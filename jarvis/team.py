@@ -392,7 +392,9 @@ class Team:
         # instead of sharing one conversation across threads.
         with self._member_locks[role.key]:
             member = self.member(role, fresh=fresh)
-            member.should_stop = self._step.is_set  # bound to this step's token
+            # Bound to this step's token (Ctrl+C), and to the chief's own stop (e.g. Stop on the dashboard).
+            member.should_stop = lambda step=self._step: step.is_set() or bool(
+                self.chief.should_stop is not None and self.chief.should_stop())
             checkpoint = len(member.messages)
             with self._lock:
                 if role.key == "sentinel":
