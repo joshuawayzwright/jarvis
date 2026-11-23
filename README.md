@@ -397,6 +397,8 @@ jarvis --web --watch --auto --budget 5 --brief-daily 08:00   # also start runs f
 
 Cost estimates use Anthropic's list prices for Claude Fable 5.2, Opus 5.5, Sonnet 5.5 and Haiku 5.5, with cache writes at the 5-minute rate ([`jarvis/pricing.py`](jarvis/pricing.py)). They don't include discounts, Bedrock or Vertex AI pricing, or Haiku 5.5's higher rate above 100K-token prompts; other models show no estimate. Check your bill in the Claude Console for actual charges.
 
+The chat and dashboard use the shared brand palette (charcoal `#0A0A0A`, weathered steel `#8A8F98`, burnished gold `#D4AF37`, electric blue `#0087FF`) in one dark theme, with a text-only JARVIS wordmark. Jarvis has no logo of its own, so the home-screen icon is a gold "J" on charcoal.
+
 **Add it to your phone's home screen** to open the dashboard like an app: in Safari, Share → *Add to Home Screen*; in Chrome, ⋮ → *Add to Home screen* (or *Install app*). It opens full screen with the Jarvis icon. The home-screen shortcut contains your secret token, like the printed link, and stops working when Jarvis restarts with a new token.
 
 The dashboard reads GitHub through your `GITHUB_TOKEN` (two requests per repository per check). Viewing it costs no tokens; only a briefing (Generate or `--brief-daily`) and runs you start call Claude. It refreshes every 15 seconds while open. Without `--watch`, the CI, pull request and alert panels are off; the briefing, runs, spending, session and memory panels still work. `--fix` is terminal-only; on the web, use the Fix with Jarvis button.
