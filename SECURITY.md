@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Please email **superadmin2712@gmail.com** with "Security" in the subject line. Include the steps to reproduce the problem and what you expected to happen. Please don't open a public issue for a security problem.
+Please email **hello@thesoloserviceprovider.com.au** with "Security" in the subject line. Include the steps to reproduce the problem and what you expected to happen. Please don't open a public issue for a security problem.
 
 You'll get a reply within 7 days.
 
