@@ -71,6 +71,7 @@ class RunLog:
         if self.jarvis is not None:
             self.summary["model"] = self.jarvis.model
             self._usage_start = dict(self.jarvis.usage)
+            self._usd_start = self.jarvis.cost_usd() if hasattr(self.jarvis, "cost_usd") else None
         self._write(f"## Goal\n\n{text}\n\n## Steps\n")
         self._save()
 
@@ -84,10 +85,12 @@ class RunLog:
         self.summary["steps"] = int(self.summary["steps"]) + 1  # type: ignore[call-overload]
         self._save()
 
-    def finish(self, ok: bool, reply: str | None = None) -> None:
-        """Record how the run ended, with the tokens it used and their estimated cost."""
-        self.summary["status"] = "done" if ok else "failed"
-        if self.jarvis is not None and self.jarvis.over_budget():
+    def finish(self, ok: bool, reply: str | None = None, status: str | None = None) -> None:
+        """Record how the run ended, with the tokens it used and their estimated cost.
+
+        `status` overrides the outcome, e.g. "cancelled" for a run stopped from the dashboard."""
+        self.summary["status"] = status or ("done" if ok else "failed")
+        if status is None and self.jarvis is not None and self.jarvis.over_budget():
             self.summary["status"] = "over budget"
         if reply:
             self.summary["reply"] = reply[:500]
@@ -96,7 +99,14 @@ class RunLog:
             usage = {k: v - self._usage_start.get(k, 0) for k, v in self.jarvis.usage.items()}
             self.summary["usage"] = usage
             self.summary["cost_usd"] = pricing.estimate_cost(self.jarvis.model, usage)
-        self._write(f"\n## Outcome\n\n{'Finished' if ok else 'Stopped with an error'}.\n")
+            # In team mode the specialists share the chief's Spend: count their cost too, not just the chief's.
+            start = getattr(self, "_usd_start", None)
+            total = self.jarvis.cost_usd() if hasattr(self.jarvis, "cost_usd") else None
+            if start is not None and total is not None:
+                self.summary["cost_usd"] = round(total - start, 6)
+        outcome = {"done": "Finished", "cancelled": "Stopped from the dashboard"}.get(str(self.summary["status"]),
+                                                                                      "Stopped with an error")
+        self._write(f"\n## Outcome\n\n{outcome}.\n")
         self._save()
 
     def crew(self, status: str) -> None:

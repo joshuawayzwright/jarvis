@@ -219,12 +219,14 @@ def make_handler(session: WebSession, token: str, dashboard: Dashboard) -> type[
             if path == "/api/approve":
                 ok = session.answer(str(data.get("id", "")), bool(data.get("approved")))
                 self._json(200 if ok else 404, {"ok": ok})
-            elif path in ("/api/jobs/run", "/api/jobs/briefing"):
+            elif path in ("/api/jobs/run", "/api/jobs/briefing", "/api/jobs/stop"):
                 if dashboard.jobs is None:
                     self._json(404, {"error": "Jobs aren't available in this session."})
                     return
                 if path == "/api/jobs/run":
                     error = dashboard.jobs.start_run(str(data.get("goal", "")))
+                elif path == "/api/jobs/stop":
+                    error = dashboard.jobs.cancel()
                 else:
                     error = dashboard.jobs.start_briefing()
                 self._json(409 if error else 202, {"error": error} if error else {"ok": True})
@@ -283,7 +285,7 @@ def manifest(token: str) -> dict[str, Any]:
     return {
         "name": "Jarvis", "short_name": "Jarvis", "display": "standalone",
         "start_url": f"/dashboard?token={token}", "scope": "/",
-        "background_color": "#0f1216", "theme_color": "#0b6bcb",
+        "background_color": "#0A0A0A", "theme_color": "#0A0A0A",
         "icons": [{"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
                   {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
                   {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"}],
@@ -304,26 +306,19 @@ PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0b6bcb">
+<meta name="theme-color" content="#0A0A0A">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Jarvis">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <title>Jarvis</title>
 <style>
-  :root { --bg:#f6f7f9; --panel:#ffffff; --text:#14171c; --muted:#5d6673; --accent:#0b6bcb; --line:#dde1e7;
-          --you:#e8f1fb; --code:#f0f2f5; --warn:#b4530f; --ok:#1f7a3a; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#0f1216; --panel:#171b21; --text:#e7eaee; --muted:#98a2ae; --accent:#5aa9ff; --line:#2a3039;
-            --you:#16273a; --code:#1f252d; --warn:#f0a35e; --ok:#5fc27e; } }
+/*BRAND*/
   * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-         display:flex; flex-direction:column; height:100dvh; }
-  header { display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--line); background:var(--panel); }
-  header h1 { font-size:18px; margin:0; flex:1; letter-spacing:.02em; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.5 var(--font); display:flex; flex-direction:column; height:100dvh; }
   header label { font-size:14px; color:var(--muted); display:flex; gap:6px; align-items:center; }
   button { font:inherit; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); padding:8px 14px; cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary { background:var(--gold); border-color:var(--gold); color:var(--on-gold); font-weight:600; }
   button:disabled { opacity:.5; cursor:default; }
   #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:12px; }
   .msg { max-width:min(760px, 100%); padding:10px 14px; border-radius:14px; background:var(--panel); border:1px solid var(--line);
@@ -339,7 +334,7 @@ PAGE = r"""<!doctype html>
   form { display:flex; gap:8px; padding:12px 16px calc(12px + env(safe-area-inset-bottom)); border-top:1px solid var(--line); background:var(--panel); }
   textarea { flex:1; resize:none; font:inherit; padding:10px; border-radius:10px; border:1px solid var(--line); background:var(--bg); color:var(--text); min-height:44px; max-height:160px; }
   .navlink { color:var(--accent); text-decoration:none; font-size:15px; }
-  #mic.on { background:var(--warn); border-color:var(--warn); color:#fff; }
+  #mic.on { background:var(--gold); border-color:var(--gold); color:var(--on-gold); }
   #crew { border-bottom:1px solid var(--line); background:var(--panel); padding:8px 16px 10px; }
   #crew[hidden] { display:none; }
   #crew summary { cursor:pointer; font-size:14px; color:var(--muted); display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
@@ -365,7 +360,7 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>Jarvis</h1>
+  <h1 class="wordmark">JARVIS</h1>
   <label><input type="checkbox" id="speak"> Speak replies</label>
   <a id="dash" class="navlink" href="#">Dashboard</a>
   <button id="reset" type="button">New chat</button>
@@ -547,26 +542,20 @@ DASHBOARD_PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0b6bcb">
+<meta name="theme-color" content="#0A0A0A">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Jarvis">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <title>Jarvis Dashboard</title>
 <style>
-  :root { --bg:#f6f7f9; --panel:#ffffff; --text:#14171c; --muted:#5d6673; --accent:#0b6bcb; --line:#dde1e7;
-          --ok:#1a7f4b; --bad:#c2321f; --warn:#b4530f; --chip:#eef1f5; --bar:#0b6bcb; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#0f1216; --panel:#171b21; --text:#e7eaee; --muted:#98a2ae; --accent:#5aa9ff; --line:#2a3039;
-            --ok:#4cc38a; --bad:#ff6b5a; --warn:#f0a35e; --chip:#222831; --bar:#3d93ee; } }
+/*BRAND*/
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { position:sticky; top:0; z-index:1; display:flex; align-items:center; gap:12px; padding:12px 16px;
-           border-bottom:1px solid var(--line); background:var(--panel); }
-  header h1 { font-size:18px; margin:0; flex:1; letter-spacing:.02em; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 var(--font); }
+  header { position:sticky; top:0; z-index:1; }
   a { color:var(--accent); text-decoration:none; }
   button { font:inherit; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); padding:6px 12px; cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary { background:var(--gold); border-color:var(--gold); color:var(--on-gold); font-weight:600; }
   button:disabled { opacity:.5; cursor:default; }
   main { max-width:1100px; margin:0 auto; padding:16px; display:grid; gap:16px; }
   .kpis { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; }
@@ -614,7 +603,7 @@ DASHBOARD_PAGE = r"""<!doctype html>
   .act .kind.error, .act .kind.declined { color:var(--bad); } .act .kind.approval { color:var(--warn); }
   .act .kind.done, .act .kind.allowed { color:var(--ok); }
   .act .when { grid-column:2; }
-  #notify.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #notify.on { background:var(--accent); border-color:var(--accent); color:var(--on-accent); }
   .run-head { display:flex; gap:8px; align-items:baseline; }
   .run-head .goal { flex:1; overflow-wrap:anywhere; }
   .status { font-size:12px; border-radius:999px; padding:0 8px; border:1px solid var(--line); white-space:nowrap; }
@@ -626,6 +615,10 @@ DASHBOARD_PAGE = r"""<!doctype html>
                font-size:12px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; }
   button.small { font-size:13px; padding:3px 10px; margin-left:8px; }
   .briefing { white-space:pre-wrap; overflow-wrap:anywhere; font-size:14px; max-height:340px; overflow:auto; }
+  .jobnow { display:flex; gap:10px; align-items:center; flex-wrap:wrap; border:1px solid var(--warn); border-radius:10px;
+            padding:8px 10px; margin-bottom:10px; font-size:14px; }
+  .jobnow[hidden] { display:none; }   /* display:flex above would otherwise override the hidden attribute */
+  .jobnow .what { flex:1; min-width:160px; overflow-wrap:anywhere; }
   .runform { display:flex; gap:8px; margin-bottom:12px; align-items:flex-start; }
   .runform textarea { flex:1; font:inherit; font-size:14px; padding:8px; border-radius:10px; border:1px solid var(--line);
                       background:var(--bg); color:var(--text); resize:vertical; min-height:42px; }
@@ -650,7 +643,7 @@ DASHBOARD_PAGE = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>Jarvis<span class="wide"> · Dashboard</span></h1>
+  <h1 class="wordmark">JARVIS<span class="wide sub"> · Dashboard</span></h1>
   <a id="state" class="pill">…</a>
   <button id="notify" type="button" title="Notify me when a build breaks" hidden>🔔</button>
   <button id="refresh" type="button">Check now</button>
@@ -671,6 +664,7 @@ DASHBOARD_PAGE = r"""<!doctype html>
     </section>
     <section><h2>Open pull requests <span class="meta" id="prcount"></span></h2><ul id="pulls" class="list"></ul></section>
     <section><h2>Autonomous runs <span class="meta">latest 10</span></h2>
+      <div id="jobnow" class="jobnow" hidden></div>
       <form id="runform" class="runform">
         <textarea id="goal" rows="2" maxlength="4000" placeholder="Goal for a new autonomous run, e.g. Fix the failing Android build in owner/repo"></textarea>
         <button id="rungo" class="primary" type="submit">Start run</button>
@@ -713,9 +707,19 @@ function kpi(label, value, sub, cls) {
   const box = el("div", "kpi"); box.append(el("div", "label", label), el("div", "value " + (cls || ""), value));
   if (sub) box.append(el("div", "sub", sub)); return box;
 }
+const short = (text, n) => text.length > n ? text.slice(0, n).trimEnd() + "…" : text;   // long goals: the start, full text on hover
+let jobsState = null;   // the latest jobs status, for the Fix buttons
 function fixLink(prompt) {
   const b = el("button", "primary", "Fix with Jarvis");
-  b.onclick = () => { location.href = "/?token=" + encodeURIComponent(token) + "#ask=" + encodeURIComponent(prompt); };
+  b.onclick = async () => {
+    if (jobsState && jobsState.allow_runs) {   // started with --auto: one tap starts a background fix run
+      if (jobsState.current) { alert("A " + jobsState.current.kind + " is already running. Stop it or wait for it to finish."); return; }
+      if (!confirm("Start an autonomous fix run? Jarvis will investigate, change code and open a draft pull request for you to review. It counts toward the spending limit.")) return;
+      if (await startJob("/api/jobs/run", {goal: prompt})) b.textContent = "Fix started";
+      return;
+    }
+    location.href = "/?token=" + encodeURIComponent(token) + "#ask=" + encodeURIComponent(prompt);   // otherwise: the chat, to review and send
+  };
   return b;
 }
 
@@ -796,7 +800,8 @@ function render(d) {
     // A run that stopped writing for 30 minutes most likely died with its process (Ctrl+C, crash, reboot).
     const stalled = r.status === "running" && d.now - (r.updated || r.started || d.now) > 1800;
     const status = stalled ? "stalled" : r.status;
-    const goal = el("span", "goal", r.kind === "briefing" ? "Briefing" : (r.goal || "(no goal)"));
+    const goal = el("span", "goal", r.kind === "briefing" ? "Briefing" : short(r.goal || "(no goal)", 160));
+    if (r.kind !== "briefing") goal.title = r.goal || "";
     if (r.kind === "briefing") goal.append(el("span", "tag brief", "read-only"));
     head.append(goal, el("span", "status " + (stalled ? "failed" : r.status), status));
     const meta = [ago(r.started, d.now), plural(r.steps || 0, "step")];
@@ -858,6 +863,16 @@ if ("Notification" in window && window.isSecureContext) {
     setNotify((await Notification.requestPermission()) === "granted");
   };
 }
+let lastFinished = null;
+function notifyFinished(f) {   // a browser notification when a run or briefing finishes (the first load only sets the baseline)
+  const at = f ? f.finished : 0;
+  if (lastFinished !== null && at > lastFinished && notifyBtn.classList.contains("on") && Notification.permission === "granted") {
+    const title = f.kind === "briefing" ? (f.status === "done" ? "Your briefing is ready" : "Briefing " + f.status)
+      : ({done: "Run finished", cancelled: "Run stopped"}[f.status] || "Run " + f.status);
+    new Notification(title, {body: f.kind === "briefing" ? "Open the dashboard to read it." : f.goal.slice(0, 120), tag: "jarvis-job"});
+  }
+  lastFinished = Math.max(lastFinished || 0, at);
+}
 function notifyNew(alerts) {
   const newest = alerts.length ? alerts[0].time : 0;
   if (lastAlert !== null && notifyBtn.classList.contains("on") && Notification.permission === "granted") {
@@ -886,8 +901,21 @@ async function fetchLog(name, pre, follow) {
 /*MARKDOWN*/
 // Briefing card, run form and job state. Jobs run in the background on the server; the page only starts them.
 function renderJobs(j, now) {
-  const card = $("briefing-card"), form = $("runform"), hint = $("runhint");
-  if (!j) { card.hidden = true; form.hidden = true; hint.hidden = true; return; }
+  const card = $("briefing-card"), form = $("runform"), hint = $("runhint"), banner = $("jobnow");
+  jobsState = j;
+  if (!j) { card.hidden = true; form.hidden = true; hint.hidden = true; banner.hidden = true; return; }
+  banner.hidden = !j.current; banner.textContent = "";
+  if (j.current) {
+    const what = j.current.kind === "briefing" ? "Making the briefing" : "Running: " + j.current.goal;
+    const label = el("span", "what", short(what, 110) + " · started " + ago(j.current.started, now)); label.title = what;
+    banner.append(label);
+    const stop = el("button", "", j.current.stopping ? "Stopping…" : "Stop");
+    stop.disabled = !!j.current.stopping;
+    stop.title = "Stops before Jarvis's next step; a command already running finishes first.";
+    stop.onclick = async () => { if (confirm("Stop this " + j.current.kind + "? Changes it already made stay as they are.")) await startJob("/api/jobs/stop"); };
+    banner.append(stop);
+  }
+  notifyFinished(j.last_finished);
   const busy = !!j.current, b = j.briefing;
   card.hidden = false;
   const go = $("briefing-go");
@@ -1000,3 +1028,24 @@ load();
 # The light Markdown renderer lives once, in the chat page; the dashboard uses the same code for the briefing.
 MARKDOWN_JS = PAGE[PAGE.index("// Light Markdown"):PAGE.index("// Speak sentence")]
 DASHBOARD_PAGE = DASHBOARD_PAGE.replace("/*MARKDOWN*/", MARKDOWN_JS)
+
+
+# Brand: Joshua Wright's shared palette (BRAND-RULES.md in joshuawayzwright/joshuawayzwright): charcoal #0A0A0A,
+# weathered steel #8A8F98, burnished gold #D4AF37, restrained electric blue #0087FF. One dark theme, because the
+# palette's blue and steel are too faint for text on white. Surfaces are tints of charcoal; lines are steel.
+# Red and green are functional CI status colours only, always shown with a word ("failing", "healthy"), never alone.
+# Text-only wordmark: there is no approved Jarvis logo, and the brand rules forbid inventing one.
+BRAND_CSS = """  :root { color-scheme:dark;
+          --charcoal:#0A0A0A; --steel:#8A8F98; --gold:#D4AF37; --electric:#0087FF;
+          --bg:var(--charcoal); --panel:#141517; --chip:#1C1D20; --code:#1C1D20; --line:rgba(138,143,152,.28);
+          --text:#F2F2F0; --muted:var(--steel); --accent:var(--electric); --on-accent:var(--charcoal); --on-gold:var(--charcoal);
+          --warn:var(--gold); --ok:#4CC38A; --bad:#FF6B5A; --bar:var(--electric); --you:rgba(0,135,255,.14);
+          --font:Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+          --display:Rajdhani, Inter, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 16px; background:var(--charcoal);
+           border-bottom:1px solid rgba(212,175,55,.45); }
+  .wordmark { font-family:var(--display); font-size:19px; font-weight:700; letter-spacing:.2em; color:var(--gold); margin:0; flex:1; }
+  .wordmark .sub { color:var(--steel); letter-spacing:.08em; font-weight:600; }
+  a:focus-visible, button:focus-visible, textarea:focus-visible, input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }"""
+PAGE = PAGE.replace("/*BRAND*/", BRAND_CSS)
+DASHBOARD_PAGE = DASHBOARD_PAGE.replace("/*BRAND*/", BRAND_CSS)
